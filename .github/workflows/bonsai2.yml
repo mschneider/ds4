@@ -1,0 +1,81 @@
+# Fork CI (Ternary Bonsai 2).  Upstream ds4 has no workflows, so this file
+# never conflicts on upstream merges.  Model-backed checks
+# (make test-bonsai2-reference) need the 7 GB GGUF and real Metal and are
+# run locally per docs/FORK_MAINTAINING.md.
+name: bonsai2
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"   # weekly upstream sync attempt
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-test:
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (no new warnings)
+        run: |
+          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
+          # ds4_metal.m carries two known upstream warnings; anything else fails.
+          if grep -E "warning:" build.log | grep -vE "metal4_disabled|ds4_gpu_compile_tensor_probe"; then
+            exit 1
+          fi
+      - name: Model-free tests
+        run: |
+          make ds4_test ds4_agent_test
+          ./ds4_test --server
+          ./ds4_agent_test
+      - name: Bonsai kernel tests
+        # Hosted macOS VMs may not expose a Metal compute device.
+        continue-on-error: true
+        run: make test-bonsai2-kernels
+      - name: CPU build
+        run: make clean && make cpu
+
+  upstream-sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bonsai2
+          fetch-depth: 0
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          git config user.name "bonsai2-sync"
+          git config user.email "bonsai2-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/antirez/ds4.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up to date"; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          branch="sync/upstream-$(date +%Y%m%d)"
+          git switch -c "$branch"
+          git merge --no-edit upstream/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Build and model-free tests
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          make -j"$(sysctl -n hw.ncpu)"
+          make ds4_test ds4_agent_test
+          ./ds4_test --server
+          ./ds4_agent_test
+      - name: Open PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}"
+          gh pr create --base bonsai2 --head "${{ steps.merge.outputs.branch }}" \
+            --title "Merge upstream $(git rev-parse --short upstream/main)" \
+            --body "Automated upstream merge. Before merging, run \`make test-bonsai2-kernels\` and \`make test-bonsai2-reference\` on a Mac (docs/FORK_MAINTAINING.md)."
