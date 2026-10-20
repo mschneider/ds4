@@ -118,7 +118,7 @@ static bool bonsai2_graph_encode_session_batch(ds4_decode_item *items, int count
         ok = ok && ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E) &&
              bonsai2_graph_ffn(g, m, l, T) &&
              ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E);
-        if (ok && il == 1u) ok = ds4_gpu_flush_commands() != 0;
+        if (ok && bonsai2_flush_after(il)) ok = ds4_gpu_flush_commands() != 0;
     }
     ok = ok && bonsai2_norm(g, m, w->output_norm, g->R, NULL, T) &&
          bonsai2_mm(g->batch_logits, m, w->output, g->mixed, T);
