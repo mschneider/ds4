@@ -276,6 +276,13 @@ static bool bonsai2_graph_ffn(ds4_qwen4_gpu_graph *g, const ds4_model *m, const 
            bonsai2_mm(g->blk, m, l->ffn_down, g->sh_mid, T);
 }
 
+/* Command buffer split points.  A decode layer runs ~7x longer on the GPU
+ * than it takes to encode, so the GPU starts on two layers, and each later
+ * segment is committed before encoding the next one could outrun it. */
+static bool bonsai2_flush_after(uint32_t il) {
+    return il == 1u || il == 9u || il == 25u;
+}
+
 /* Same contract as qwen4_graph_forward_tokens.  Bonsai has no MTP, so only
  * the last row's logits are ever requested. */
 static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -301,8 +308,7 @@ static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model
              bonsai2_graph_ffn(g, m, l, T) &&
              ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E) &&
              qwen4_graph_apply_steering_ffn(g, il, T);
-        /* start the GPU on the first layers while the rest is encoded */
-        if (ok && il == 1u) ok = ds4_gpu_flush_commands() != 0;
+        if (ok && bonsai2_flush_after(il)) ok = ds4_gpu_flush_commands() != 0;
     }
     if (ok && logits_out) {
         ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * E * sizeof(float),
