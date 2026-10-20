@@ -87,10 +87,14 @@ back with the reference fork on the same machine (`llama-bench -fa 1`):
 
 | | ds4 | PrismML llama.cpp |
 |---|---:|---:|
-| prefill 512 | 60–65 t/s | 32.6 t/s |
-| decode | 11.3 t/s | 7.5 t/s |
+| prefill 512 | 50–62 t/s | 32.6 t/s |
+| decode | 11.5–13.3 t/s | 7.5 t/s |
 
-Decode is limited by the PQ2_0 matvec. Its 2-bit decode is ALU-bound at
-about 165 GB/s of weight streaming (`make bench-bonsai2-kernels`), against
-roughly 245 GB/s for a plain read. Normal power mode should help both
-numbers. Re-measure there before quoting absolute figures.
+The PQ2_0 matvec decodes codes as fp16 denormals (one AND per two weights;
+see `metal/bonsai2.metal`) and streams at about the copy rate in short bursts:
+0.10 ms for 5120 → 17408, 230 GB/s (`make bench-bonsai2-kernels`). Under
+Low Power Mode the GPU clock drops after a burst. The same kernel run 3000
+times back to back takes 0.23 ms per call, and in the model it averages
+0.17 ms. Decode numbers therefore depend on power state and thermals more
+than on the kernels. Re-measure with Low Power Mode off before quoting
+absolute figures.

@@ -4,7 +4,8 @@
  * exactly how the engine binds GGUF ranges.
  *
  *   make test-bonsai2-kernels                 correctness
- *   make bench-bonsai2-kernels                decode/prefill throughput */
+ *   make bench-bonsai2-kernels                decode/prefill throughput
+ *   tests/bonsai2/test_kernels --bench-decode  matvec only */
 
 #include <math.h>
 #include <stdbool.h>
@@ -678,7 +679,8 @@ static void bench_matmul(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int 
 }
 
 int main(int argc, char **argv) {
-    const int bench = argc > 1 && strcmp(argv[1], "--bench") == 0;
+    const int decode_only = argc > 1 && strcmp(argv[1], "--bench-decode") == 0;
+    const int bench = decode_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
     require_ok(ds4_gpu_init(), "GPU initialization");
     map_create(bench ? (1100ull << 20) : (512ull << 20));
     g_rng = 0xb0d5a12ull;
@@ -689,10 +691,13 @@ int main(int argc, char **argv) {
         bench_matmul(17408, 5120, 1, 64);
         bench_matmul(6144, 5120, 1, 64);
         bench_matmul(5120, 248320, 1, 8);
+        bench_matmul(5120, 17408, 2, 64);
         bench_matmul(5120, 17408, 4, 64);
         bench_matmul(5120, 17408, 8, 64);
-        bench_matmul(5120, 17408, 512, 8);
-        bench_matmul(17408, 5120, 512, 8);
+        if (!decode_only) {
+            bench_matmul(5120, 17408, 512, 8);
+            bench_matmul(17408, 5120, 512, 8);
+        }
         ds4_gpu_cleanup();
         return 0;
     }

@@ -7,9 +7,9 @@
  * bytes, so inside a row they are only 2-byte aligned: all weight loads are
  * half/ushort sized.
  *
- * The PQ2_0 dot product and FWHT shapes follow the PrismML llama.cpp fork
- * (ggml-metal mul_mv.metal q2_dot_coeffs, mul_mm.metal kernel_mul_mm,
- * misc.metal kernel_fwht_tg; MIT licensed). */
+ * The PQ2_0 GEMM and FWHT shapes follow the PrismML llama.cpp fork
+ * (ggml-metal mul_mm.metal kernel_mul_mm, misc.metal kernel_fwht_tg; MIT
+ * licensed). */
 
 #define BONSAI2_QK     128
 #define BONSAI2_QBYTES 34
@@ -36,24 +36,32 @@ struct bonsai2_rot_args {
 /* ---------------------------------------------------------------------------
  * PQ2_0 matvec, NT = 1..8 activation rows.
  *
- * Decode streams ~7 GB of weights per token.  The weight loads are cheap
- * (a load-only skeleton of this kernel streams at the copy rate); the 2-bit
- * decode is what limits it, so the inner loop is built to minimize ALU work.
- * Each simdgroup owns NR0 output rows; TPB lanes share one 128-weight block
- * (4*BPT weights per lane) and the simdgroup walks 32/TPB blocks per step.
+ * Decode streams ~7 GB of weights per token, so a single token must decode
+ * 2-bit codes cheaply enough to keep up with DRAM.  Each simdgroup owns NR0
+ * output rows; TPB lanes share one 128-weight block (4*BPT weights per lane)
+ * and the simdgroup walks 32/TPB blocks per step.
  *
- * Base-4 trick: with byte b = t0 + 4 t1 + 16 t2 + 64 t3 and g1 = b>>6,
- * g2 = b>>4, g3 = b>>2 (exact floors of power-of-two scaled floats),
- *   sum t_n y_n = g1 (y3 - 4 y2) + g2 (y2 - 4 y1) + g3 (y1 - 4 y0) + b y0,
- * so the activations are staged once per block as these coefficients
- * (shared by the NR0 rows) and each byte costs three floors plus four fmas;
- * the code offset (-1) is folded in as d * (dot - sum y).
+ * fp16 denormal decode: a 32-bit word u holds 16 codes, weights 0-7 in its
+ * low half and 8-15 in its high half, code k at bit 2k of its half.  Masking
+ * both halves at once, as_type<half2>(u & (0x00030003 << 2k)), yields two
+ * fp16 denormals c * 2^(2k-24), so one AND decodes two weights and the
+ * half -> float conversion folds into the fma.  Codes 5-7 sit in the
+ * exponent bits and are shifted down by 6 first (one shift per word).  The
+ * power of two is folded into the activations when they are staged
+ * (bonsai2_den_scale, shared by the NR0 rows), and the code offset (-1) is
+ * folded in as d * (dot - sum y).  This streams at about the copy rate.
  *
- * For NT > 1 every weight is loaded once and the floors are shared by TC = 2
- * tokens per pass.  Staging more tokens at once (or keeping all decoded
- * rows live) runs out of registers and was measured to be much slower.
+ * For NT > 1 every weight is loaded once and TC tokens are staged per pass.
+ * Staging more tokens at once runs out of registers: from three tokens on,
+ * one token per pass with 8 rows per simdgroup was measured fastest.
  * ------------------------------------------------------------------------- */
-template <short NT, short NR0, short BPT>
+/* 2^(24 - p) for the bit position p a code sits at inside its half after
+ * masking (codes 0-4 in place, 5-7 after the >> 6), indexed by weight & 7. */
+constant float bonsai2_den_scale[8] = {
+    16777216.0f, 4194304.0f, 1048576.0f, 262144.0f, 65536.0f, 1048576.0f, 262144.0f, 65536.0f,
+};
+
+template <short NT, short NR0, short BPT, short TCX>
 kernel void kernel_bonsai2_mv_pq2(
         constant bonsai2_mm_args &a [[buffer(0)]],
         device const uchar       *w [[buffer(1)]],
@@ -67,7 +75,7 @@ kernel void kernel_bonsai2_mv_pq2(
     constexpr short BPS = 32 / TPB;      /* blocks per simdgroup step */
     constexpr short WPT = 4 * BPT;       /* weights per lane */
     constexpr short NQ  = BPT / 2;       /* ushort code words per lane */
-    constexpr short TC  = NT < 2 ? NT : 2; /* tokens staged per decode pass */
+    constexpr short TC  = NT < TCX ? NT : TCX; /* tokens staged per decode pass */
 
     const uint nb = a.in_dim / BONSAI2_QK;
     const uint row0 = (tg * nsg + sg) * NR0;
@@ -114,35 +122,42 @@ kernel void kernel_bonsai2_mv_pq2(
                 for (short j = 0; j < BPT; j++) {
                     const float4 v = xp[j];
                     sumy[t] += (v.x + v.y) + (v.z + v.w);
-                    c[t][4*j + 0] = v.w - 4.0f * v.z;
-                    c[t][4*j + 1] = v.z - 4.0f * v.y;
-                    c[t][4*j + 2] = v.y - 4.0f * v.x;
-                    c[t][4*j + 3] = v.x;
+#pragma unroll
+                    for (short e = 0; e < 4; e++) c[t][4*j + e] = v[e] * bonsai2_den_scale[(4*j + e) & 7];
                 }
             }
 #pragma unroll
             for (short r = 0; r < NR0; r++) {
-                float g[WPT];
+                float s[TC];
 #pragma unroll
-                for (short j = 0; j < NQ; j++) {
-                    const float b0 = (float)(q[r][j] & 0xff);
-                    const float b1 = (float)(q[r][j] >> 8);
-                    g[8*j + 0] = floor(b0 * (1.0f / 64.0f));
-                    g[8*j + 1] = floor(b0 * (1.0f / 16.0f));
-                    g[8*j + 2] = floor(b0 * (1.0f / 4.0f));
-                    g[8*j + 3] = b0;
-                    g[8*j + 4] = floor(b1 * (1.0f / 64.0f));
-                    g[8*j + 5] = floor(b1 * (1.0f / 16.0f));
-                    g[8*j + 6] = floor(b1 * (1.0f / 4.0f));
-                    g[8*j + 7] = b1;
+                for (short t = 0; t < TC; t++) s[t] = 0.0f;
+#pragma unroll
+                for (short j = 0; j < NQ / 2; j++) {
+                    const uint u = (uint)q[r][2*j] | ((uint)q[r][2*j + 1] << 16);
+                    const uint u6 = u >> 6;
+                    half2 h[8];
+                    h[0] = as_type<half2>(u  & 0x00030003u);
+                    h[1] = as_type<half2>(u  & 0x000C000Cu);
+                    h[2] = as_type<half2>(u  & 0x00300030u);
+                    h[3] = as_type<half2>(u  & 0x00C000C0u);
+                    h[4] = as_type<half2>(u  & 0x03000300u);
+                    h[5] = as_type<half2>(u6 & 0x00300030u);
+                    h[6] = as_type<half2>(u6 & 0x00C000C0u);
+                    h[7] = as_type<half2>(u6 & 0x03000300u);
+#pragma unroll
+                    for (short t = 0; t < TC; t++) {
+                        if (t0 + t >= NT) break;
+#pragma unroll
+                        for (short k = 0; k < 8; k++) {
+                            s[t] = fma((float)h[k].x, c[t][16*j + k], s[t]);
+                            s[t] = fma((float)h[k].y, c[t][16*j + 8 + k], s[t]);
+                        }
+                    }
                 }
 #pragma unroll
                 for (short t = 0; t < TC; t++) {
                     if (t0 + t >= NT) break;
-                    float s = 0.0f;
-#pragma unroll
-                    for (short k = 0; k < WPT; k++) s = fma(g[k], c[t][k], s);
-                    acc[r][t0 + t] = fma(d[r], s - sumy[t], acc[r][t0 + t]);
+                    acc[r][t0 + t] = fma(d[r], s[t] - sumy[t], acc[r][t0 + t]);
                 }
             }
         }
@@ -158,19 +173,19 @@ kernel void kernel_bonsai2_mv_pq2(
     }
 }
 
-typedef decltype(kernel_bonsai2_mv_pq2<1, 4, 4>) bonsai2_mv_pq2_t;
+typedef decltype(kernel_bonsai2_mv_pq2<1, 4, 4, 2>) bonsai2_mv_pq2_t;
 
-/* NR0/BPT measured on M4 Pro (5120 -> 17408): 4 rows suit one or two
- * tokens; from three tokens on, 8 rows per simdgroup amortize the per-token
- * activation staging better.  The wrapper sizes its grid from these NR0. */
-template [[host_name("kernel_bonsai2_mv_pq2_1")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<1, 4, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_2")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<2, 4, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_3")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<3, 8, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_4")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<4, 8, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_5")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<5, 8, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_6")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<6, 8, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_7")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<7, 8, 4>;
-template [[host_name("kernel_bonsai2_mv_pq2_8")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<8, 8, 4>;
+/* NR0/BPT/TC measured on M4 Pro (5120 -> 17408): 4 rows suit one or two
+ * tokens; from three tokens on, 8 rows and one token per pass.  The wrapper
+ * sizes its grid from these NR0. */
+template [[host_name("kernel_bonsai2_mv_pq2_1")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<1, 4, 4, 2>;
+template [[host_name("kernel_bonsai2_mv_pq2_2")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<2, 4, 4, 2>;
+template [[host_name("kernel_bonsai2_mv_pq2_3")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<3, 8, 4, 1>;
+template [[host_name("kernel_bonsai2_mv_pq2_4")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<4, 8, 4, 1>;
+template [[host_name("kernel_bonsai2_mv_pq2_5")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<5, 8, 4, 1>;
+template [[host_name("kernel_bonsai2_mv_pq2_6")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<6, 8, 4, 1>;
+template [[host_name("kernel_bonsai2_mv_pq2_7")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<7, 8, 4, 1>;
+template [[host_name("kernel_bonsai2_mv_pq2_8")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<8, 8, 4, 1>;
 
 /* ---------------------------------------------------------------------------
  * PQ2_0 GEMM for prefill: a 64 (weight rows) x 32 (tokens) output tile per
