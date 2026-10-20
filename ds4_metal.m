@@ -48720,7 +48720,7 @@ static uint32_t qwen4_moe_mm_dispatch_experts(qwen4_moe_mm_args *args) {
 }
 
 static id<MTLComputePipelineState> g_qwen4_pipelines[QWEN4_K_COUNT];
-#define QWEN4_ATTN_NSG 4
+#define QWEN4_ATTN_NSG 6
 #define QWEN4_ATTN_MAX_SPLITS 64
 #define QWEN4_ATTN_ROWS_MAX 64     /* decode batch rows the attention rows kernels take */
 
