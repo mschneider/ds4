@@ -537,6 +537,9 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    /* fork-owned variants start at 200 so upstream additions never take
+     * the same KV-cache model id */
+    DS4_VARIANT_BONSAI2 = 200,
 } ds4_variant;
 
 typedef struct {
@@ -1025,6 +1028,8 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
 }
+
+#include "ds4_bonsai2_shape.inc"
 
 static int g_ds4_lock_fd = -1;
 
@@ -2351,6 +2356,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [142] = {"pq2_0", 128,  34},   /* PrismML ternary (Bonsai 2) */
 };
 
 enum {
@@ -2369,6 +2375,7 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_PQ2_0    = 142,
 };
 
 typedef struct {
@@ -5885,6 +5892,9 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static void weights_validate_bonsai2_layout(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end,
+                                            bool require_token_embd, bool require_output);
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5897,6 +5907,11 @@ static void weights_validate_layout(
                                         layer_end,
                                         require_token_embd,
                                         require_output);
+        return;
+    }
+    if (ds4_model_is_bonsai2()) {
+        weights_validate_bonsai2_layout(w, layer_start, layer_end,
+                                        require_token_embd, require_output);
         return;
     }
     if (ds4_model_is_qwen4()) {
@@ -7153,6 +7168,8 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+#include "ds4_bonsai2_model.inc"
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7171,6 +7188,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "qwen35")) {
+            config_validate_bonsai2_model(m);
             return;
         }
     }
@@ -7649,7 +7670,9 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_bonsai2()) {
+        weights_bind_bonsai2_output(w, m, required, optional);
+    } else if (ds4_model_is_qwen4()) {
         if (required) {
             w->output_hc_norm = required_tensor(m, "output_hc_norm.weight");
             w->output_hc_down = required_tensor(m, "output_hc_down.weight");
@@ -7826,6 +7849,10 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
 }
 
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (ds4_model_is_bonsai2()) {
+        weights_bind_bonsai2_layer(l, m, il);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
         return;
@@ -58836,6 +58863,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
+    if (ds4_model_is_bonsai2()) return bonsai2_graph_alloc(g, ctx_cap, cap_tokens, shared, state_pool, hist_pool, slot);
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -59663,6 +59691,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
+    if (ds4_model_is_bonsai2()) return bonsai2_graph_forward_tokens(g, m, w, tokens, T, logits_out, all_rows);
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
@@ -60236,6 +60265,8 @@ static int generate_qwen4_metal_argmax(
 }
 
 #endif
+
+#include "ds4_bonsai2.inc"
 
 #ifndef DS4_NO_GPU
 /* Metal generation entry point.  The model runs as one local whole-graph
@@ -63157,6 +63188,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (ds4_model_is_bonsai2()) return 2;   /* dense PQ2_0: tags its KV files */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -68046,6 +68078,9 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
+    case DS4_TENSOR_PQ2_0:
+        bonsai2_pq2_row(m, t, row, out);
+        break;
     case DS4_TENSOR_F32:
         memcpy(out, (const float *)tensor_data(m, t) + row * n, n * sizeof(float));
         break;
@@ -71859,6 +71894,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_bonsai2() && !opt->inspect_only && !bonsai2_engine_supported(opt, e->backend)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -80181,9 +80221,12 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
     return ok && qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
 }
 
+#include "ds4_bonsai2_batch.inc"
+
 static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int count,
                                                     ds4_qwen4_gpu_graph *g,
                                                     const ds4_model *m, const ds4_weights *w) {
+    if (ds4_model_is_bonsai2()) return bonsai2_graph_encode_session_batch(items, count, g, m, w);
     const uint32_t T = (uint32_t)count;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;

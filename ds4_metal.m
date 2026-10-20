@@ -25,6 +25,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_metal_internal.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -4787,6 +4788,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
     ];
+    required_sources = [required_sources arrayByAddingObjectsFromArray:ds4_metal_fork_sources() ?: @[]];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
@@ -50535,3 +50537,18 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
+
+/* ds4_metal_internal.h: trampolines for out-of-tree kernel files. */
+id<MTLDevice> ds4_metal_device(void) { return g_device; }
+id<MTLLibrary> ds4_metal_library(void) { return g_library; }
+id<MTLComputePipelineState> ds4_metal_get_pipeline(const char *name) { return ds4_gpu_get_pipeline(name); }
+id<MTLCommandBuffer> ds4_metal_command_buffer(int *owned) { return ds4_gpu_command_buffer(owned); }
+id<MTLComputeCommandEncoder> ds4_metal_compute_encoder(id<MTLCommandBuffer> cb) { return ds4_gpu_compute_encoder(cb); }
+void ds4_metal_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) { ds4_gpu_end_compute_encoder(cb, enc); }
+int ds4_metal_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) { return ds4_gpu_finish_command_buffer(cb, owned, label); }
+id<MTLBuffer> ds4_metal_tensor_buffer(const ds4_gpu_tensor *t) { return ds4_gpu_tensor_buffer(t); }
+NSUInteger ds4_metal_tensor_offset(const ds4_gpu_tensor *t) { return ds4_gpu_tensor_offset(t); }
+id<MTLBuffer> ds4_metal_wrap_model_range(const void *map, uint64_t size, uint64_t off, uint64_t len, uint64_t *inner) {
+    return ds4_gpu_wrap_model_range(map, size, off, len, inner);
+}
+__attribute__((weak)) NSArray<NSArray<NSString *> *> *ds4_metal_fork_sources(void) { return nil; }
