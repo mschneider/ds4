@@ -107,6 +107,7 @@
 /tests/test_qwen4_mtp_prefill
 /tests/test_qwen4_mtp_policy
 /tests/test_qwen_tool_disk_key
+/tests/test_qwen4_ple_prefetch
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli

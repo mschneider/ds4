@@ -1171,6 +1171,16 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+tests/test_qwen4_ple_prefetch.o: tests/test_qwen4_ple_prefetch.c ds4.c ds4.h ds4_qwen4_vision.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_ple_prefetch: tests/test_qwen4_ple_prefetch.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
 ifeq ($(UNAME_S),Darwin)
 tests/test_qwen4_resident_arithmetic.o: tests/test_qwen4_resident_arithmetic.c ds4.c ds4.h ds4_gpu.h ds4_qwen4_vision.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
@@ -1527,6 +1537,7 @@ clean:
 	rm -f tests/test_qwen4_mtp_prefill
 	rm -f tests/test_qwen4_generation
 	rm -f tests/test_qwen4_resident_arithmetic
+	rm -f tests/test_qwen4_ple_prefetch
 	rm -f tests/test_web_recovery
 	rm -f tests/test_qwen_tool_disk_key
 	rm -f tests/test_metal_ssd_experts
