@@ -19,6 +19,13 @@ static inline int ds4_metal_device_name_uses_qwen_legacy_moe_tuning(const char *
            strcmp(name, "Apple M3 Ultra") != 0;
 }
 
+/* Any M4 variant (M4, M4 Pro, M4 Max), bounded like the checks above so
+ * future names such as M40 do not inherit M4 measurements. */
+static inline int ds4_metal_device_name_is_m4(const char *name) {
+    return name && strncmp(name, "Apple M4", 8) == 0 &&
+           (name[8] == '\0' || name[8] == ' ');
+}
+
 /* Share the M5 tuning policy with M6. Keep the generation token bounded so
  * untested future names such as M50 and M60 do not inherit these defaults.
  * Callers must still check runtime and kernel capabilities where required. */

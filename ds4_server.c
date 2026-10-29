@@ -2505,6 +2505,10 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
         if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (text_is_blank(msg.reasoning)) {
+            free(msg.reasoning);
+            msg.reasoning = NULL;
+        }
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -3143,9 +3147,7 @@ static bool chat_last_assistant_replays_reasoning(const chat_msgs *msgs) {
     for (int i = msgs->len - 1; i >= 0; i--) {
         const chat_msg *m = &msgs->v[i];
         if (strcmp(m->role, "assistant")) continue;
-        const char *p = m->reasoning;
-        while (p && isspace((unsigned char)*p)) p++;
-        return p && *p;
+        return !text_is_blank(m->reasoning);
     }
     return false;
 }
@@ -5286,12 +5288,13 @@ item_fail:
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "reasoning")) {
             /* Stash so it merges into the next assistant message. summary is the
-             * short-form list, content is the verbose chain. Either can be empty. */
-            if (summary && summary[0]) {
+             * short-form list, content is the verbose chain. Either can be empty; whitespace-only
+             * echoes are dropped like blank reasoning_content. */
+            if (!text_is_blank(summary)) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
                 buf_puts(&pending_reasoning, summary);
             }
-            if (content && content[0]) {
+            if (!text_is_blank(content)) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
                 buf_puts(&pending_reasoning, content);
             }
@@ -10142,6 +10145,9 @@ typedef struct tool_memory_block {
     char *dsml;
     size_t len;
     size_t leading;
+    /* The body after `leading` starts with a tool-call opener; computed once
+     * so the per-store prefix scan does not rescan every matched body. */
+    bool tool_start;
     size_t bytes;
     int refs;
     uint64_t seen;
@@ -10585,6 +10591,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     b->dsml = xstrndup(dsml, len);
     b->len = len;
     b->leading = tool_memory_leading_ws(dsml, len);
+    b->tool_start = find_any_tool_start(b->dsml + b->leading) == b->dsml + b->leading;
     b->bytes = len + 1 + sizeof(*b);
     unsigned char *body = (unsigned char *)b->dsml + b->leading;
     size_t body_len = b->len - b->leading;
@@ -11218,8 +11225,7 @@ static int kv_tool_map_select_block(void *data, size_t len, void *arg) {
     (void)len;
     tool_memory_block *head = data;
     kv_tool_map_selection *sel = arg;
-    const char *body = head->dsml + head->leading;
-    if (find_any_tool_start(body) != body) return 1;
+    if (!head->tool_start) return 1;
     for (tool_memory_block *b = head; b; b = b->same_body_next) {
         if (b->seen == sel->scan || b->leading > (size_t)(sel->start - sel->text)) continue;
         if (memcmp(sel->start - b->leading, b->dsml, b->leading)) continue;

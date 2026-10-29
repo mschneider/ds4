@@ -48803,7 +48803,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
             const bool specialize = override >= 0 ? override != 0 :
                 ds4_gpu_device_name_contains("M3 Ultra") ||
-                ds4_gpu_device_name_contains("M4") ||
+                ds4_metal_device_name_is_m4(g_metal_device_name) ||
                 ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
                 (kernel >= QWEN4_K_MOE_MM_MID_K32_NT4 && kernel <= QWEN4_K_MOE_MM_DOWN_F16_K32_NT4) ||
                 qwen4_moe_mm_legacy_ssd(mm->n_tokens, mm->weight_type);
@@ -49080,7 +49080,7 @@ static bool qwen4_prefill_reuse(uint32_t n_tokens) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_PREFILL_REUSE");
     return override >= 0 ? override > 0 :
         n_tokens >= 1024u && (ds4_gpu_device_name_contains("M3 Ultra") ||
-                              ds4_gpu_device_name_contains("M4"));
+                              ds4_metal_device_name_is_m4(g_metal_device_name));
 }
 
 int ds4_gpu_qwen4_conv_stream_tensor(
@@ -49188,7 +49188,7 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
         const uint32_t prefill_default_nsg =
             n_tokens >= 8192u && n_k_head == 16u && n_v_head == 48u &&
             ds4_gpu_device_name_contains("M3 Ultra") ? 4u :
-            ds4_gpu_device_name_contains("M4") ? 2u : 1u;
+            ds4_metal_device_name_is_m4(g_metal_device_name) ? 2u : 1u;
         const uint32_t nsg = n_tokens <= 2u ?
             (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GDN_NSG", default_nsg, 1u, 8u) :
             (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GDN_PREFILL_NSG", prefill_default_nsg, 1u, 8u);
@@ -50453,7 +50453,7 @@ static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
         ((type == 16u || type == 10u) && (ds4_gpu_device_name_contains("M3 Ultra") ||
-                                          ds4_gpu_device_name_contains("M4"))) ||
+                                          ds4_metal_device_name_is_m4(g_metal_device_name))) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_or_m6_apple_silicon()));
 }
 

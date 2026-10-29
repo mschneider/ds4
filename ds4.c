@@ -59970,10 +59970,10 @@ static bool qwen4_graph_mtp_boundary(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
 /* With inputs_staged the caller has already crossed the predictor boundary
  * and staged this chunk (overlapping the next chunk's n-gram reads). */
-static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
-        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t T,
-        float *logits_out, bool all_rows, qwen4_projection_phase phase,
-        bool inputs_staged, double stage_start) {
+/* Shape and token checks shared by the forward and by callers that stage
+ * inputs ahead of it, so nothing is written for a chunk the forward rejects. */
+static bool qwen4_graph_tokens_fit(const ds4_qwen4_gpu_graph *g,
+        const int *tokens, uint32_t T, bool all_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
@@ -59982,6 +59982,14 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
             return false;
         }
     }
+    return true;
+}
+
+static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
+        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t T,
+        float *logits_out, bool all_rows, qwen4_projection_phase phase,
+        bool inputs_staged, double stage_start) {
+    if (!qwen4_graph_tokens_fit(g, tokens, T, all_rows)) return false;
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
@@ -77495,7 +77503,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             bool ok;
             if (prefetch.rows) {
                 const double stage_start = now_sec();
-                ok = qwen4_graph_mtp_boundary(&s->qwen4_graph, &e->model, &e->weights, prompt->v[i]) &&
+                ok = qwen4_graph_tokens_fit(&s->qwen4_graph, prompt->v + i, chunk, false) &&
+                     qwen4_graph_mtp_boundary(&s->qwen4_graph, &e->model, &e->weights, prompt->v[i]) &&
                      qwen4_graph_stage_inputs(&s->qwen4_graph, &e->model, &e->weights,
                                               prompt->v + i, chunk,
                                               prefetch_ready ? prefetch.rows : NULL);
