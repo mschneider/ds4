@@ -113,8 +113,10 @@ void ds4_session_payload_file_free(ds4_session_payload_file *p) {
                         "{\"role\":\"tool\",\"tool_call_id\":\"call_test\",\"content\":\"ok\"}"
 static const char schemas[] = "[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}}}]";
 static const char raw_tool[] = "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>";
-static const char sampled_suffix[] = "new hidden reasoning\n</think>\n\nRunning.\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>";
-static const char visible_suffix[] = "\n</think>\n\nRunning.\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>";
+/* Post-decode commits the assistant EOS before a tool-turn checkpoint is
+ * remembered (#1169), so the live session and both key forms end with it. */
+static const char sampled_suffix[] = "new hidden reasoning\n</think>\n\nRunning.\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call><|im_end|>";
+static const char visible_suffix[] = "\n</think>\n\nRunning.\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call><|im_end|>";
 
 static void append_turn(buf *wire, const char *turn) {
     assert(wire->len && wire->ptr[wire->len - 1] == ']');
@@ -200,7 +202,7 @@ static void storage_case(const char *name, const char *input, bool echo_key, int
             suffix_off = probe.suffix_off;
             selected_visible = probe.kind == REUSE_THINKING_VISIBLE;
         } else {
-            kv_cache_store_current(&s, &slot, "evict");
+            kv_cache_store_current(&s, &slot, "evict", NULL);
             ds4_kvstore_entry e = read_published(&s);
             assert(ds4_kvstore_find_text_prefix(&s.kv, next.prompt_text, 5, 4, 8192) == 0);
             suffix_off = (size_t)e.text_bytes;
@@ -221,7 +223,7 @@ static void storage_case(const char *name, const char *input, bool echo_key, int
     } else buf_puts(&sampled, r.prompt_text);
     set_sampled(&session, sampled.ptr, sampled_suffix);
     record(&s, &slot, &r, selected_visible);
-    kv_cache_store_current(&s, &slot, "evict");
+    kv_cache_store_current(&s, &slot, "evict", NULL);
     /* Scan through the on-disk inventory, rather than relying on a fabricated
      * entry or a key selected by the fixture. */
     ds4_kvstore_entry e = read_published(&s);
