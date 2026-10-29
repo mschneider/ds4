@@ -841,6 +841,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    bool qwen_chat_replays_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -3138,6 +3139,17 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+static bool chat_last_assistant_replays_reasoning(const chat_msgs *msgs) {
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "assistant")) continue;
+        const char *p = m->reasoning;
+        while (p && isspace((unsigned char)*p)) p++;
+        return p && *p;
+    }
+    return false;
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -4487,6 +4499,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->qwen_chat_replays_reasoning =
+        r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        chat_last_assistant_replays_reasoning(&msgs);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -13235,11 +13250,18 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
                                                        const char *finish,
                                                        bool inside_thinking,
                                                        const char *content,
-                                                       const tool_calls *calls) {
+                                                       const tool_calls *calls,
+                                                       bool visible_continuation) {
     char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
                                                      inside_thinking, content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
+    /* ponytail: a first tool turn has no replay-style evidence. Keep its visible
+     * default; matching both future styles would require alternate disk keys. */
+    pthread_mutex_lock(&s->tool_mu);
+    slot->thinking_live.token_text_disk_key =
+        j->req.qwen_chat_replays_reasoning && !visible_continuation;
+    pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),
@@ -14906,7 +14928,9 @@ decode_again:
         if (!remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
-                &parsed_calls))
+                &parsed_calls,
+                thinking_live_continuation ||
+                (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE)))
         {
             thinking_live_clear(s, slot);
         }

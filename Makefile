@@ -1434,7 +1434,7 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 .PHONY: test-frontends
-test-frontends: ds4_test ds4_agent_test test-web-recovery
+test-frontends: ds4_test ds4_agent_test test-web-recovery test-qwen-tool-disk-key
 	./ds4_test --server
 	./ds4_agent_test
 
@@ -1445,7 +1445,16 @@ test-web-recovery: tests/test_web_recovery
 tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -Wno-unused-function -o $@ tests/test_web_recovery.c
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
+.PHONY: test-qwen-tool-disk-key
+test-qwen-tool-disk-key: tests/test_qwen_tool_disk_key
+	./tests/test_qwen_tool_disk_key
+
+# Model-free server/storage regression; unused inference code is discarded.
+tests/test_qwen_tool_disk_key: tests/test_qwen_tool_disk_key.c ds4_server.c ds4.h ds4_tool_text.h ds4_kvstore.c ds4_kvstore.h rax.c rax.h rax_malloc.h \
+	ds4_distributed.h ds4_gpu_args.h ds4_gpu_mgpu.h ds4_help.h ds4_tp.h ds4_ssd.h
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c99 -D_GNU_SOURCE -DDS4_NO_GPU -ffunction-sections -fdata-sections -o $@ tests/test_qwen_tool_disk_key.c ds4_kvstore.c rax.c -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) -lm -pthread
+
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery test-qwen-tool-disk-key \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -1519,6 +1528,7 @@ clean:
 	rm -f tests/test_qwen4_generation
 	rm -f tests/test_qwen4_resident_arithmetic
 	rm -f tests/test_web_recovery
+	rm -f tests/test_qwen_tool_disk_key
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_ssd_reuse
 	rm -f tests/test_metal_command_memory
