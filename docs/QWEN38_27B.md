@@ -15,9 +15,9 @@ on Apple Silicon at no measurable quality cost against a Q4_K_M reference.
 |---|---|
 | 1. Load plain `qwen35` GGUFs as a variant beside Bonsai 2; one-token and prefill graph | done: greedy tokens match llama.cpp on all six reference cases |
 | 2. Measure per-token overhead outside weight streaming | 15.1 tok/s on the 15.4 GB recipe (M4 Pro): the trunk streams at ≈210 GB/s, overhead is small |
-| 3. Q4_K product that reads each weight once for 1–4 rows | done but not yet a win at two rows (below); the open problem |
-| 4. MTP head on the existing Qwen3.8 speculative cycle | done: greedy output identical with `--mtp`, 78% accepted, 14.4 tok/s (slower than plain until step 3) |
-| 5. All-4-bit GGUF recipe and KLD/quality check against Q4_K_M and BF16 | recipe built (`Qwen3.8-27B-Q4K-MTP.gguf`, 15.42 GB); imatrix and KLD todo |
+| 3. Cheap 2-4-row verification | done: half-activation Q4_K/Q6_K matvecs; no measurable quality cost |
+| 4. MTP head on the existing Qwen3.8 speculative cycle | done: on C6 with half-activation verification, 18.5-18.8 tok/s vs 13.1 plain (1.4x), greedy output identical |
+| 5. 4-bit recipe at Q4_K_M quality | done: C6 (Q4_K FFN/embedding, Q6_K GDN/attention/head, imatrix), 17.37 GB, passes the official gate |
 
 Each step records what it measured here when it lands.
 
@@ -346,6 +346,38 @@ misc/qwen38-27b/venv/bin/python gguf-tools/qwen38_27b_quantize.py \
     --set gdn=Q6_K --set attn=Q6_K --set head=Q6_K \
     [--mtp gguf/qwen38-27b/mtp-Qwen3.8-27B-BF16.gguf] --out Qwen3.8-27B-C6.gguf
 ```
+
+## MTP on the C6 recipe
+
+`Qwen3.8-27B-C6-MTP.gguf` (17.61 GB: C6 plus the MTP layer at Q4_K, without
+imatrix data since `llama-imatrix` never runs it). MTP verification uses the
+half-activation Q4_K/Q6_K matvecs (`kernel_bonsai2_mv_{q4k,q6k}_h`):
+
+Quality of half activations, forced onto every decode step
+(`DS4_QWEN35_HALF_X=all`) against C6 in fp32:
+
+| | KLD | top-1 | short NLL | short first token | long NLL | long first token |
+|---|---:|---:|---:|---:|---:|---:|
+| C6 fp32 | 0.03228 | 94.08% | | 90 | | 12/12 |
+| C6 half activations | 0.03231 | 94.08% | -0.002% | 90 | -0.005% | 12/12 |
+
+API top-1 and pair agreement are identical on both fixtures. Half
+activations cost nothing measurable, so they are the default for 2-8-row
+verify passes; single-row decode stays fp32.
+
+Speed (`misc/qwen38-27b/bench/mtp_bench.sh`: three rendered reference
+prompts, 256 greedy tokens, AC power and High Power Mode checked before
+each run):
+
+| prompt | plain | MTP, fp32 verify | MTP, half verify | accepted |
+|---|---:|---:|---:|---:|
+| code | 13.20 | 12.69 | **18.45** | 81.0% |
+| math | 13.07 | 13.76 | **18.62** | 95.2% |
+| Italian translation | 13.04 | 13.02 | **18.77** | 86.9% |
+
+tok/s; output is byte-identical across all modes. Plain decode streams the
+17.4 GB at about 228 GB/s. MTP with half verification is 1.40-1.44x plain
+decode at the same quality, about 1.58x ggml-org's Q4_K_M without MTP.
 
 ## Measurements (M4 Pro, 16-core GPU, AC power, High Power Mode)
 

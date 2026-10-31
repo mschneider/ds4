@@ -57,15 +57,20 @@ static bool bonsai2_signs_ready(void) {
  * matvec for one or two rows (one pass each, so a two-row verify row is
  * bit-identical to a decode step) and the simdgroup-matrix product for
  * 3-8, where it is cheaper. */
-/* DS4_QWEN35_HALF_X selects the half-activation Q4_K/Q6_K matvecs for 1-8
- * rows: "verify" for 2-8 rows (MTP verification), "all" also for single-row
- * decode (to measure their quality against fp32 on the decode path).
- * Diagnostic while the quality gates decide the release path. */
+/* Q4_K/Q6_K projections of 2-8 rows (MTP verification) read their
+ * activations as half: in fp32 a second row costs ~1.8x on M4 Pro, which
+ * cancels MTP, while the half-activation matvec makes it nearly free.  On the
+ * C6 recipe forcing them onto every decode step moved KLD by 3e-5 and the
+ * official continuation NLL by -0.002% (short) / -0.005% (long), and MTP's
+ * greedy output stayed byte-identical (docs/QWEN38_27B.md).  Prefill GEMMs
+ * already round activations to half.  Single-row decode stays fp32.
+ * DS4_QWEN35_HALF_X=off keeps fp32 verification and =all also covers
+ * single-row decode: diagnostics for A/B and quality runs. */
 static uint32_t bonsai2_half_x_min_rows(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_QWEN35_HALF_X");
-        v = e && !strcmp(e, "all") ? 1 : e && !strcmp(e, "verify") ? 2 : 0;
+        v = e && !strcmp(e, "off") ? 0 : e && !strcmp(e, "all") ? 1 : 2;
     }
     return (uint32_t)v;
 }
