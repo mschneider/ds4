@@ -69,8 +69,10 @@ def main():
     ap.add_argument("--ds4", default=os.path.join(ROOT, "ds4"))
     ap.add_argument("--tol", type=float, default=0.05)
     ap.add_argument("--case", action="append")
+    ap.add_argument("--golden", default=os.path.join(HERE, "golden.json"),
+                    help="reference file (tests/qwen38_27b/golden.json for plain Qwen3.8-27B)")
     args = ap.parse_args()
-    with open(os.path.join(HERE, "golden.json"), encoding="utf-8") as f:
+    with open(args.golden, encoding="utf-8") as f:
         golden = json.load(f)
     failed = 0
     with tempfile.TemporaryDirectory() as tmp:

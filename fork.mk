@@ -35,6 +35,18 @@ bench-bonsai2-kernels: tests/bonsai2/test_kernels
 # model; BONSAI2_MODEL overrides the default gguf/ path).
 test-bonsai2-reference: ds4
 	./tests/bonsai2/check_reference.py $(if $(BONSAI2_MODEL),--model $(BONSAI2_MODEL))
+
+# Plain Qwen3.8-27B against llama.cpp on the same GGUF (QWEN38_27B_MODEL
+# overrides it).  Greedy tokens must match exactly.  The logprob tolerance is
+# llama.cpp's error, not ds4's: its few-row Q4_K matmuls round activations to
+# half, and a float64 recomputation of layer 0 agrees with ds4 to 2e-7 but
+# with llama.cpp only to 3e-3, which reaches 0.1-0.35 in top-5 logprobs
+# (docs/QWEN38_27B.md).
+QWEN38_27B_MODEL ?= gguf/qwen38-27b/Qwen3.8-27B-Q4KM-Q8.gguf
+.PHONY: test-qwen38-27b-reference
+test-qwen38-27b-reference: ds4
+	./tests/bonsai2/check_reference.py --model $(QWEN38_27B_MODEL) \
+		--golden tests/qwen38_27b/golden.json --tol 0.4
 endif
 
 # ds4.c textually includes the fork engine code.
