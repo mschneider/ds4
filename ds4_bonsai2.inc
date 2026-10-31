@@ -57,10 +57,28 @@ static bool bonsai2_signs_ready(void) {
  * matvec for one or two rows (one pass each, so a two-row verify row is
  * bit-identical to a decode step) and the simdgroup-matrix product for
  * 3-8, where it is cheaper. */
+/* DS4_QWEN35_HALF_X selects the half-activation Q4_K/Q6_K matvecs for 1-8
+ * rows: "verify" for 2-8 rows (MTP verification), "all" also for single-row
+ * decode (to measure their quality against fp32 on the decode path).
+ * Diagnostic while the quality gates decide the release path. */
+static uint32_t bonsai2_half_x_min_rows(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_QWEN35_HALF_X");
+        v = e && !strcmp(e, "all") ? 1 : e && !strcmp(e, "verify") ? 2 : 0;
+    }
+    return (uint32_t)v;
+}
+
 static bool bonsai2_mm_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t T, uint32_t rows) {
     if (!rows || rows > w->dim[1]) rows = (uint32_t)w->dim[1];
     const uint32_t in = (uint32_t)w->dim[0];
+    const uint32_t half_min = bonsai2_half_x_min_rows();
+    if (half_min && T >= half_min && T <= 8u && (w->type == DS4_TENSOR_Q4_K || w->type == DS4_TENSOR_Q6_K) &&
+        ds4_gpu_bonsai2_mv_half_tensor(out, m->map, m->size, w->abs_offset, w->type, in, rows, x, T)) {
+        return true;
+    }
     if (w->type == DS4_TENSOR_Q6_K) {
         if (ds4_gpu_bonsai2_matmul_q6k_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T)) return true;
         fprintf(stderr, "ds4: qwen35 Q6_K matmul failed for %.*s (%u tokens)\n", (int)w->name.len, w->name.ptr, T);

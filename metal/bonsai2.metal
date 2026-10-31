@@ -736,3 +736,134 @@ kernel void kernel_bonsai2_mv_q6k(
 template [[host_name("kernel_bonsai2_mul_mm_q6_K_f32")]] kernel mul_mm_t
 kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K,
               float, float4x4, float, float2x4>;
+
+/* --- half-activation multi-row matvecs (MTP verification) ------------- */
+
+/* x (fp32) -> half, once per projection input. */
+kernel void kernel_bonsai2_f32_to_f16(
+        device const float *x [[buffer(0)]],
+        device half        *y [[buffer(1)]],
+        constant uint      &n [[buffer(2)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i < n) y[i] = (half)x[i];
+}
+
+/* Q4_K and Q6_K matvecs for NT (1..4) activation rows read in half, after
+ * MLX's qmv_wide (Apache-2.0): each weight row is owned by 16 lanes that
+ * split its K range, so the two rows of a simdgroup read the same
+ * activations (one load), and each lane decodes 32 weights at a time into
+ * fp32 registers once and applies them to every activation row, summing in
+ * fp32.  Half activations halve the activation traffic, which is what makes
+ * a second row nearly free on M4 Pro (docs/QWEN38_27B.md, kernel study);
+ * ds4's prefill GEMMs already round activations to half the same way. */
+template <short NT>
+kernel void kernel_bonsai2_mv_q4k_h(
+        constant bonsai2_q4k_mm_args &a [[buffer(0)]],
+        device const uchar        *w [[buffer(1)]],
+        device const half         *x [[buffer(2)]],
+        device float              *y [[buffer(3)]],
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr short KL = 16;
+    const short kl = lane % KL;
+    const uint out_row = (tg * 2u + sg) * 2u + lane / KL;
+    device const uchar *wrow = w + (ulong)min(out_row, a.out_dim - 1u) * a.row_bytes;
+    float acc[NT];
+    for (short t = 0; t < NT; t++) acc[t] = 0.0f;
+    const uint ng = a.in_dim / 32u;
+    for (uint gi = kl; gi < ng; gi += KL) {
+        const uint b = gi >> 3, g = gi & 7u;
+        device const uchar *blk = wrow + b * 144u;
+        const float2 dd = float2(*(device const half2 *)blk);
+        device const uchar *sc = blk + 4;
+        uint sv, mv;
+        if (g < 4u) { sv = sc[g] & 63u; mv = sc[g + 4] & 63u; }
+        else { sv = (sc[g + 4] & 0xFu) | ((sc[g - 4] & 0xC0u) >> 2); mv = (sc[g + 4] >> 4) | ((sc[g] & 0xC0u) >> 2); }
+        const float ds = dd.x * (float)sv, dm = dd.y * (float)mv;
+        device const uint2 *run = (device const uint2 *)(blk + 16u + (g >> 1) * 32u);
+        const uint shift = (g & 1u) * 4u;
+        device const half4 *xg = (device const half4 *)(x + gi * 32u);
+        for (short c = 0; c < 4; c++) {
+            const uint2 q = run[c] >> shift;
+            const float4 w0 = ds * float4(q.x & 15u, (q.x >> 8) & 15u, (q.x >> 16) & 15u, (q.x >> 24) & 15u) - dm;
+            const float4 w1 = ds * float4(q.y & 15u, (q.y >> 8) & 15u, (q.y >> 16) & 15u, (q.y >> 24) & 15u) - dm;
+            for (short t = 0; t < NT; t++) {
+                device const half4 *xt = xg + (ulong)t * (a.in_dim / 4u) + 2 * c;
+                acc[t] += dot(w0, float4(xt[0])) + dot(w1, float4(xt[1]));
+            }
+        }
+    }
+    for (short t = 0; t < NT; t++) {
+        acc[t] += simd_shuffle_down(acc[t], 8);
+        acc[t] += simd_shuffle_down(acc[t], 4);
+        acc[t] += simd_shuffle_down(acc[t], 2);
+        acc[t] += simd_shuffle_down(acc[t], 1);
+    }
+    if (kl == 0 && out_row < a.out_dim) {
+        for (short t = 0; t < NT; t++) y[(ulong)t * a.out_dim + out_row] = acc[t];
+    }
+}
+
+/* Q6_K: a chunk is 8 consecutive l of one 128-value half of a block, which
+ * holds 32 weights at k = h*128 + {0,32,64,96} + l (ggml's layout), each
+ * 8-run under its own int8 scale. */
+template <short NT>
+kernel void kernel_bonsai2_mv_q6k_h(
+        constant bonsai2_q4k_mm_args &a [[buffer(0)]],
+        device const uchar        *w [[buffer(1)]],
+        device const half         *x [[buffer(2)]],
+        device float              *y [[buffer(3)]],
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr short KL = 16;
+    const short kl = lane % KL;
+    const uint out_row = (tg * 2u + sg) * 2u + lane / KL;
+    device const uchar *wrow = w + (ulong)min(out_row, a.out_dim - 1u) * a.row_bytes;
+    float acc[NT];
+    for (short t = 0; t < NT; t++) acc[t] = 0.0f;
+    const uint nc = a.in_dim / 32u;               /* 8 chunks per 256-value block */
+    for (uint ci = kl; ci < nc; ci += KL) {
+        const uint b = ci >> 3, h = (ci >> 2) & 1u, l0 = (ci & 3u) * 8u;
+        device const uchar *blk = wrow + b * 210u;
+        device const uchar *ql = blk + h * 64u + l0;
+        device const uchar *qh = blk + 128u + h * 32u + l0;
+        device const char *sc = (device const char *)(blk + 192u) + h * 8u + l0 / 16u;
+        const float d = (float)(*(device const half *)(blk + 208u));
+        const float s0 = d * sc[0], s1 = d * sc[2], s2 = d * sc[4], s3 = d * sc[6];
+        /* 210-byte blocks are only 2-byte aligned: byte loads */
+        float w0[8], w1[8], w2[8], w3[8];
+        for (short j = 0; j < 8; j++) {
+            const uint qlj = ql[j], q32 = ql[32 + j], qhj = qh[j];
+            w0[j] = s0 * (float)((int)((qlj & 0xF) | ((qhj & 3u) << 4)) - 32);
+            w1[j] = s1 * (float)((int)((q32 & 0xF) | (((qhj >> 2) & 3u) << 4)) - 32);
+            w2[j] = s2 * (float)((int)((qlj >> 4) | (((qhj >> 4) & 3u) << 4)) - 32);
+            w3[j] = s3 * (float)((int)((q32 >> 4) | (((qhj >> 6) & 3u) << 4)) - 32);
+        }
+        const uint k0 = b * 256u + h * 128u + l0;
+        for (short t = 0; t < NT; t++) {
+            device const half *xt = x + (ulong)t * a.in_dim + k0;
+            float s = 0.0f;
+            for (short j = 0; j < 8; j++) {
+                s += w0[j] * (float)xt[j] + w1[j] * (float)xt[32 + j] +
+                     w2[j] * (float)xt[64 + j] + w3[j] * (float)xt[96 + j];
+            }
+            acc[t] += s;
+        }
+    }
+    for (short t = 0; t < NT; t++) {
+        acc[t] += simd_shuffle_down(acc[t], 8);
+        acc[t] += simd_shuffle_down(acc[t], 4);
+        acc[t] += simd_shuffle_down(acc[t], 2);
+        acc[t] += simd_shuffle_down(acc[t], 1);
+    }
+    if (kl == 0 && out_row < a.out_dim) {
+        for (short t = 0; t < NT; t++) y[(ulong)t * a.out_dim + out_row] = acc[t];
+    }
+}
+
+#define BONSAI2_MV_H(nt) \
+    template [[host_name("kernel_bonsai2_mv_q4k_h_" #nt)]] kernel decltype(kernel_bonsai2_mv_q4k_h<nt>) kernel_bonsai2_mv_q4k_h<nt>; \
+    template [[host_name("kernel_bonsai2_mv_q6k_h_" #nt)]] kernel decltype(kernel_bonsai2_mv_q6k_h<nt>) kernel_bonsai2_mv_q6k_h<nt>;
+BONSAI2_MV_H(1) BONSAI2_MV_H(2) BONSAI2_MV_H(3) BONSAI2_MV_H(4)

@@ -385,6 +385,72 @@ int ds4_gpu_bonsai2_matmul_q6k_tensor(
     }
 }
 
+/* Half copies of the activations for the half-activation matvecs: one
+ * scratch buffer, grown on demand.  Writes and reads are ordered in the
+ * command batch, so consecutive projections can reuse it. */
+static ds4_gpu_tensor *g_bonsai2_xh;
+static uint64_t g_bonsai2_xh_bytes;
+
+int ds4_gpu_bonsai2_mv_half_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t weight_type, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if ((weight_type != 12u && weight_type != 14u) || n_tok == 0 || n_tok > 8 || in_dim == 0 ||
+        in_dim % 256 != 0 || out_dim == 0 || !ds4_gpu_init()) {
+        return 0;
+    }
+    const uint64_t xh_bytes = (uint64_t)n_tok * in_dim * sizeof(uint16_t);
+    if (g_bonsai2_xh_bytes < xh_bytes) {
+        ds4_gpu_tensor_free(g_bonsai2_xh);
+        g_bonsai2_xh = ds4_gpu_tensor_alloc(xh_bytes);
+        g_bonsai2_xh_bytes = g_bonsai2_xh ? xh_bytes : 0;
+        if (!g_bonsai2_xh) return 0;
+    }
+    const uint32_t row_bytes = in_dim / 256 * (weight_type == 12u ? 144u : 210u);
+    const uint32_t n = n_tok * in_dim;
+    bonsai2_bind cv[2];
+    if (!bonsai2_bind_tensor(&cv[0], x, (uint64_t)n * sizeof(float), "half x src") ||
+        !bonsai2_bind_tensor(&cv[1], g_bonsai2_xh, xh_bytes, "half x")) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_metal_get_pipeline("kernel_bonsai2_f32_to_f16");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:cv[0].buf offset:cv[0].off atIndex:0];
+        [enc setBuffer:cv[1].buf offset:cv[1].off atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+        if (!ds4_metal_finish_command_buffer(cb, owned, "bonsai2 f32 -> f16")) return 0;
+    }
+    const bonsai2_q4k_mm_args args = { in_dim, out_dim, row_bytes, n_tok };
+    bonsai2_bind b[3];
+    if (!bonsai2_bind_model(&b[0], model_map, model_size, weight_offset, (uint64_t)out_dim * row_bytes, "weight") ||
+        !bonsai2_bind_tensor(&b[1], g_bonsai2_xh, xh_bytes, "half x") ||
+        !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "half mv out")) {
+        return 0;
+    }
+    for (uint32_t t0 = 0; t0 < n_tok; t0 += 4) {
+        const uint32_t nt = n_tok - t0 < 4 ? n_tok - t0 : 4;
+        bonsai2_bind bt[3] = { b[0], b[1], b[2] };
+        bt[1].off += (NSUInteger)t0 * in_dim * sizeof(uint16_t);
+        bt[2].off += (NSUInteger)t0 * out_dim * sizeof(float);
+        char name[48];
+        snprintf(name, sizeof(name), "kernel_bonsai2_mv_%s_h_%u", weight_type == 12u ? "q4k" : "q6k", nt);
+        if (!bonsai2_dispatch(name, &args, sizeof(args), bt, 3,
+                              MTLSizeMake((out_dim + 3) / 4, 1, 1), MTLSizeMake(32, 2, 1), 0)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Must match struct bonsai2_gdn_out_args in metal/bonsai2.metal. */
 typedef struct {
     uint32_t n_tok;

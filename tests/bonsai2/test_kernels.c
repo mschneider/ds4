@@ -849,6 +849,48 @@ static void test_matmul_q6k(uint32_t in_dim, uint32_t out_dim, const uint32_t *t
     free(wr);
 }
 
+/* Half-activation matvec: against the double reference on the same
+ * half-rounded activations (the kernel's arithmetic contract), so the
+ * tolerance stays tight; the rounding itself is measured end to end. */
+static void test_mv_half(uint32_t type, uint32_t in_dim, uint32_t out_dim, const uint32_t *toks, int n) {
+    const uint64_t w_off = type == 12u ? map_q4k(in_dim, out_dim) : map_q6k(in_dim, out_dim);
+    double *wr = malloc((uint64_t)in_dim * sizeof(double));
+    for (int c = 0; c < n; c++) {
+        const uint32_t n_tok = toks[c];
+        float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
+        ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
+        ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
+        require_ok(ds4_gpu_bonsai2_mv_half_tensor(ty, g_map, g_map_size, w_off, type, in_dim, out_dim, tx, n_tok),
+                   "half mv");
+        float *y = download(ty, (uint64_t)n_tok * out_dim);
+        const uint32_t stride = out_dim > 4096 ? 37u : 1u;
+        double err = 0.0;
+        for (uint32_t o = 0; o < out_dim; o++) {
+            if (o % stride != 0 && o + 8 < out_dim) continue;
+            if (type == 12u) q4k_row(g_map + w_off, in_dim, o, wr); else q6k_row(g_map + w_off, in_dim, o, wr);
+            for (uint32_t t = 0; t < n_tok; t++) {
+                const float *xr = x + (uint64_t)t * in_dim;
+                double sum = 0.0, mag = 0.0;
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    const double xh = (double)(_Float16)xr[i];
+                    sum += wr[i] * xh;
+                    mag += fabs(wr[i] * xh);
+                }
+                const double e = fabs((double)y[(uint64_t)t * out_dim + o] - sum) / (mag + 1e-30);
+                if (e > err) err = e;
+            }
+        }
+        char what[96];
+        snprintf(what, sizeof(what), "%s half-x %5u -> %6u  n_tok %u", type == 12u ? "q4k" : "q6k", in_dim, out_dim, n_tok);
+        report(what, err, 1e-5);
+        free(x);
+        free(y);
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(ty);
+    }
+    free(wr);
+}
+
 /* Time of one projection for n_tok rows: the shared Q4_K path (classic
  * matvec, one pass per row up to 8, GEMM above) against the simdgroup-matrix
  * kernel. */
@@ -879,6 +921,21 @@ static void bench_q4k(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int ite
             if (rep > 0 && dt < best[k]) best[k] = dt;
         }
     }
+    double half_best = 1e30;
+    if (n_tok <= 8) {
+        for (int rep = 0; rep < 4; rep++) {
+            require_ok(ds4_gpu_begin_commands(), "begin commands");
+            const double t0 = now_s();
+            for (int i = 0; i < iters; i++) {
+                require_ok(ds4_gpu_bonsai2_mv_half_tensor(ty, g_map, g_map_size, offs[i % copies], 12u, in_dim,
+                                                          out_dim, tx, n_tok), "bench half");
+            }
+            require_ok(ds4_gpu_end_commands(), "end commands");
+            const double dt = (now_s() - t0) / iters;
+            if (rep > 0 && dt < half_best) half_best = dt;
+        }
+    }
+    printf("  q4k %5u -> %6u  n_tok %u: half-x %6.3f ms\n", in_dim, out_dim, n_tok, half_best * 1e3);
     printf("  q4k %5u -> %6u  n_tok %u: shared %6.3f ms %6.1f GB/s   mma %6.3f ms %6.1f GB/s\n",
            in_dim, out_dim, n_tok, best[0] * 1e3, wbytes / best[0] * 1e-9,
            best[1] * 1e3, wbytes / best[1] * 1e-9);
@@ -984,6 +1041,11 @@ int main(int argc, char **argv) {
     const uint32_t q6k_toks[] = { 1, 2, 8, 9, 64 };
     test_matmul_q6k(5120, 1024, q6k_toks, 5);
     test_matmul_q6k(6144, 5120, q6k_toks, 5);
+    const uint32_t half_toks[] = { 1, 2, 3, 4, 7 };
+    test_mv_half(12u, 5120, 1024, half_toks, 5);
+    test_mv_half(12u, 17408, 5120, half_toks, 5);
+    test_mv_half(14u, 5120, 1024, half_toks, 5);
+    test_mv_half(14u, 6144, 5120, half_toks, 5);
     test_gdn_out_silu(1);
     test_gdn_out_silu(3);
     test_gemv_bf16_pair(1);
