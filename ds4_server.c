@@ -3939,13 +3939,15 @@ static bool live_kv_renders_end_token(server_model_syntax syntax) {
 /* True when the turn that just finished is replayed by the client as a closed
  * assistant message, i.e. when the renderer's end token belongs in the live KV.
  * A tool-call turn stops as soon as </tool_call> is parsed and never samples the
- * token; a stop-token turn sampled it but never fed it back.  A client stop
- * sequence and an output/context limit close nothing the client can replay. */
-static bool live_kv_turn_needs_end_token(const char *finish, int stop_token,
-                                         int end_token) {
+ * token; a turn that stopped on any generation stop token (EOS or, for Qwen,
+ * <|endoftext|>) sampled it but never fed it back, and the client replay closes
+ * it with the renderer's end token either way.  A client stop sequence, a
+ * thinking control marker and an output/context limit close nothing the client
+ * can replay. */
+static bool live_kv_turn_needs_end_token(const char *finish,
+                                         bool generation_stop) {
     if (finish && !strcmp(finish, "tool_calls")) return true;
-    return finish && !strcmp(finish, "stop") && stop_token >= 0 &&
-           end_token >= 0 && stop_token == end_token;
+    return finish && !strcmp(finish, "stop") && generation_stop;
 }
 
 static bool live_kv_boundary_ready(server_model_syntax syntax, bool end_committed) {
@@ -14584,10 +14586,13 @@ decode_again:
      * full re-prefill of the conversation.  One decode step here costs a
      * sampling interval; omitting it costs a re-prefill of everything after the
      * last checkpoint that still matches. */
+    /* Raw completions replay prompt+completion text with no end token. */
+    const bool closes_chat_turn = j->req.kind == REQ_CHAT;
     const int turn_end_token = ds4_token_eos(s->engine);
     bool turn_end_committed = false;
-    if (live_kv_renders_end_token(j->req.model_syntax) &&
-        live_kv_turn_needs_end_token(finish, stop_token, turn_end_token) &&
+    if (closes_chat_turn && turn_end_token >= 0 &&
+        live_kv_renders_end_token(j->req.model_syntax) &&
+        live_kv_turn_needs_end_token(finish, ds4_token_is_stop(s->engine, stop_token)) &&
         !g_stop_requested && !job_cancelled(j))
     {
         turn_end_committed = server_eval_token(s, slot, turn_end_token, err, sizeof(err)) == 0;
@@ -14596,7 +14601,8 @@ decode_again:
                        "ds4-server: turn end token not kept in live KV: %s",
                        err[0] ? err : "decode failed");
     }
-    bool frontier_ready = live_kv_boundary_ready(j->req.model_syntax, turn_end_committed) &&
+    bool frontier_ready = (!closes_chat_turn ||
+                           live_kv_boundary_ready(j->req.model_syntax, turn_end_committed)) &&
                           ds4_session_checkpoint_valid(slot->session);
 
     if (job_cancelled(j)) {
@@ -19799,18 +19805,17 @@ static void test_legacy_qwen_tool_visible_boundary(void) {
 static void test_live_kv_keeps_replayed_turn_end_token(void) {
     /* A replayed assistant turn must end with the same end token the renderer
      * writes, or the next request's exact token prefix diverges there. */
-    const int end = 248046;
     TEST_ASSERT(!live_kv_boundary_ready(SERVER_MODEL_SYNTAX_QWEN, false));
     TEST_ASSERT(live_kv_boundary_ready(SERVER_MODEL_SYNTAX_QWEN, true));
     TEST_ASSERT(live_kv_boundary_ready(SERVER_MODEL_SYNTAX_GLM, false));
-    TEST_ASSERT(live_kv_turn_needs_end_token("tool_calls", -1, end));
-    TEST_ASSERT(live_kv_turn_needs_end_token("stop", end, end));
-    /* Thinking control markers and client stop sequences are not the marker. */
-    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", end - 1, end));
-    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", -1, end));
-    TEST_ASSERT(!live_kv_turn_needs_end_token("length", end, end));
-    TEST_ASSERT(!live_kv_turn_needs_end_token("error", -1, end));
-    TEST_ASSERT(!live_kv_turn_needs_end_token(NULL, end, end));
+    TEST_ASSERT(live_kv_turn_needs_end_token("tool_calls", false));
+    /* Any generation stop token closes the turn, not only EOS. */
+    TEST_ASSERT(live_kv_turn_needs_end_token("stop", true));
+    /* Thinking control markers and client stop sequences are not stop tokens. */
+    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", false));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("length", true));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("error", false));
+    TEST_ASSERT(!live_kv_turn_needs_end_token(NULL, true));
     /* GLM renders no end token after an assistant message. */
     TEST_ASSERT(live_kv_renders_end_token(SERVER_MODEL_SYNTAX_QWEN));
     TEST_ASSERT(live_kv_renders_end_token(SERVER_MODEL_SYNTAX_DEEPSEEK));
