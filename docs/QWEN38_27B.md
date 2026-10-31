@@ -13,13 +13,30 @@ on Apple Silicon at no measurable quality cost against a Q4_K_M reference.
 
 | Step | State |
 |---|---|
-| 1. Load plain `qwen35` GGUFs as a variant beside Bonsai 2; one-token and prefill graph | in progress |
-| 2. Measure per-token overhead outside weight streaming | todo |
-| 3. Q4_K matvec that reads each weight once for 1–4 rows | todo |
-| 4. MTP head on the existing Qwen3.8 speculative cycle | todo |
-| 5. All-4-bit GGUF recipe and KLD/quality check against Q4_K_M and BF16 | todo |
+| 1. Load plain `qwen35` GGUFs as a variant beside Bonsai 2; one-token and prefill graph | done: greedy tokens match llama.cpp on all six reference cases |
+| 2. Measure per-token overhead outside weight streaming | first run: 12.1 tok/s on 19.4 GB (≈235 GB/s), controlled bench pending |
+| 3. Q4_K matvec that reads each weight once for 1–4 rows | kernel done and tested; timing pending |
+| 4. MTP head on the existing Qwen3.8 speculative cycle | designed (below), todo |
+| 5. All-4-bit GGUF recipe and KLD/quality check against Q4_K_M and BF16 | recipe tool done; imatrix and KLD todo |
 
 Each step records what it measured here when it lands.
+
+## Usage
+
+```sh
+make
+python3 -m venv misc/qwen38-27b/venv && misc/qwen38-27b/venv/bin/pip install numpy huggingface_hub
+make -C gguf-tools quants-shared
+hf download ggml-org/Qwen3.8-27B-GGUF Qwen3.8-27B-BF16.gguf --local-dir gguf/qwen38-27b
+misc/qwen38-27b/venv/bin/python gguf-tools/qwen38_27b_quantize.py \
+    --src gguf/qwen38-27b/Qwen3.8-27B-BF16.gguf --out gguf/qwen38-27b/Qwen3.8-27B-Q4K.gguf
+./ds4 -m gguf/qwen38-27b/Qwen3.8-27B-Q4K.gguf -c 32768
+```
+
+The server lists the model as `qwen3.8-27b`. Any `qwen35` GGUF whose
+projections are Q4_K, Q8_0, BF16, F16 or F32 loads; ggml-org's Q4_K_M uses
+Q6_K for `attn_output` and `output`, which `--keep-quantized --proj Q8_0`
+converts while copying everything else.
 
 ## Model
 
@@ -179,6 +196,23 @@ shares `token_embd` and `output`, so no sidecar duplicates them. Acceptance
 must be checked with the head at Q4_K and at Q8_0; mlx-lm #990 found the
 difference within ±0.3 points.
 
+## Verification
+
+`make test-qwen38-27b-reference` runs Bonsai's six reference cases (five
+short chats and a 3960-token Italian passage) against llama.cpp's greedy
+output on the same GGUF. ds4 reproduces every token. Top-5 logprobs differ by
+up to 0.32, against 0.012 for Bonsai, and the difference is llama.cpp's:
+
+- llama.cpp against itself (flash attention off, ubatch 16) differs by at most
+  0.019, so the gap is systematic, not run-to-run noise.
+- Per-layer hidden states agree to about 3e-4 relative at layer 0 and drift
+  slowly through 64 layers; the first visible gap is layer 0's FFN.
+- A float64 numpy recomputation of that FFN from the same weights (gguf-py
+  dequantization) matches ds4 to 2e-7 relative and llama.cpp only to 3e-3:
+  llama.cpp's few-row Q4_K matmuls round activations to half.
+
+The golden file therefore checks tokens exactly and logprobs at 0.4.
+
 ## Validation plan
 
 - Kernel tests against double-precision CPU references, model-free, in
@@ -194,14 +228,45 @@ difference within ±0.3 points.
 
 ## Open questions
 
-- V-head order of plain GGUFs. PrismML kept `ssm_out` in HF grouped order and
-  Bonsai permutes before it; llama.cpp's converter may reorder `ssm_out` to the
-  tiled order. Settled numerically against the reference in step 1.
+- (Settled) V-head order of plain GGUFs: llama.cpp's converter reorders
+  `ssm_out`'s columns to the tiled order (`conversion/qwen.py`), so the plain
+  graph gates the scan output in place with no permutation.
 - Whether the Q4_K dequantization is cheap enough for 4 rows to stay
   bandwidth-bound on M4 Pro, or whether a simpler 4.5 bpw block format
   (Q4_0-like with a min) is faster at equal quality.
 - Long-context behavior: attention traffic grows and acceptance falls; the
   adaptive depth policy may need a context term.
+
+## MTP design (step 4)
+
+From llama.cpp's `graph_mtp` (`src/models/qwen35.cpp`):
+
+```
+h   = output_norm(trunk residual of row t)                 (h_nextn)
+x   = eh_proj([enorm(embd(next token)), hnorm(h)])         10240 -> 5120
+x  += attention(attn_norm(x))                              layer 64's own KV cache
+x  += ffn(post_attention_norm(x))
+h'  = shared_head_norm(x)                                  chained drafts feed h' back
+logits = output(h')
+```
+
+The GGUF stores it as `blk.64.*` with `nextn.{eh_proj, enorm, hnorm,
+shared_head_norm}` and `block_count` 65. ds4's Qwen3.8 cycle calls
+`qwen4_graph_mtp_steps(row, next_tokens, T, idx)` with the MTP KV index equal
+to the trunk position of the source row, and `qwen4_graph_mtp_chain_step` for
+the second draft. The family graph needs:
+
+1. the `output_norm`ed trunk rows of the last forward kept for drafting;
+2. all-row logits for 2- and 3-row verifies, and GDN state and conv history
+   snapshots after rows 0 and 1 (the shared scan kernels already take them);
+3. its own `mtp_steps` and `chain_step`, redirected at the first line of the
+   Qwen3.8 functions, using the Q4_K multi-row matvec for the head;
+4. the recipe tool merging `blk.64` from the MTP GGUF without its duplicated
+   `token_embd` and `output`.
+
+Flash Next fills the MTP layer's KV cache only from drafting positions;
+llama.cpp also runs the MTP layer over the prompt. Which one gives better
+acceptance on the 27B is measured, not assumed.
 
 ## References
 
