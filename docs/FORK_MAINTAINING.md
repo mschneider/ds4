@@ -59,6 +59,11 @@ break Bonsai silently: it still compiles, but produces wrong tokens.
 
 - `ds4_qwen4_gpu_graph` fields and `DS4_QWEN4_SCRATCH_FIELDS`, `qwen4_graph_free`,
   `qwen4_graph_alloc_f32`, and the session/payload code that walks the graph.
+- Prefill GEMM: `ds4_metal_matmul_f16_buffer` in the trampoline block copies
+  the n_tok > 8 branch of `ds4_gpu_matmul_f16_tensor_impl` (pipeline names,
+  `ds4_gpu_make_mm_args`, threadgroup memory, grid). If upstream changes that
+  branch, update the copy; the `f16` cases of `make test-bonsai2-kernels`
+  catch a mismatch.
 - Kernels: `ds4_gpu_qwen4_conv_stream_tensor`, `_gdn_prep_tensor`,
   `_gdn_scan_tensor` (tiled `h % Hk` V order, `ssm_a = -exp(A_log)`), and
   `_attn_decode_tensor` in dense mode. `kernel_bonsai2_attn_prep` calls

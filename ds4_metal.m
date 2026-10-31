@@ -50570,3 +50570,49 @@ id<MTLBuffer> ds4_metal_wrap_model_range(const void *map, uint64_t size, uint64_
     return ds4_gpu_wrap_model_range(map, size, off, len, inner);
 }
 __attribute__((weak)) NSArray<NSArray<NSString *> *> *ds4_metal_fork_sources(void) { return nil; }
+/* The n_tok > 8 GEMM of ds4_gpu_matmul_f16_tensor_impl on an F16 weight that
+ * already lives in a GPU buffer (rows of in_dim halves) instead of the model
+ * map.  Joins the open batch like every wrapper. */
+int ds4_metal_matmul_f16_buffer(ds4_gpu_tensor *out, id<MTLBuffer> wbuf, NSUInteger woff,
+                                uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!wbuf || n_tok <= 8) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf) return 0;
+        const uint64_t row_bytes = (uint64_t)in_dim * sizeof(uint16_t);
+        const bool nax = ds4_gpu_mpp_available() && n_tok >= 32u && (in_dim % 32u) == 0 &&
+                         (out_dim % 64u) == 0 && (n_tok % 32u) == 0;
+        const uint32_t tile_n = !nax ? 32u : (n_tok % 128u) == 0 ? 128u : (n_tok % 64u) == 0 ? 64u : 32u;
+        const bool bc_inp = (in_dim % 32u) != 0;
+        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        id<MTLComputePipelineState> pipeline = nax
+            ? ds4_gpu_get_mul_mm_pipeline(tile_n == 128u ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128"
+                                          : tile_n == 64u ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64"
+                                                          : "kernel_mul_mm_f16_f32_mpp_direct_rhs", false, false)
+            : ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:woff atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        if (nax) {
+            [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tok / tile_n, out_dim / 64u, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((n_tok + 31u) / 32u, (out_dim + 63u) / 64u, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "F16 buffer matmul");
+    }
+}

@@ -298,6 +298,33 @@ kernel void kernel_bonsai2_mm_pq2(
 }
 
 /* ---------------------------------------------------------------------------
+ * PQ2_0 -> F16 unpack for the prefill GEMM.  One thread expands one 16-bit
+ * word (8 weights) into rows of in_dim halves, the layout upstream's
+ * kernel_mul_mm_f16_f32 reads.  Values are (code - 1) * d computed in half,
+ * the same exact values kernel_bonsai2_mm_pq2 stages.  Rows are whole
+ * blocks, so the global block index walks the matrix contiguously.
+ * ------------------------------------------------------------------------- */
+kernel void kernel_bonsai2_unpack_pq2_f16(
+        constant bonsai2_mm_args &a [[buffer(0)]],
+        device const uchar       *w [[buffer(1)]],
+        device half4             *y [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint n_words = a.out_dim * (a.in_dim / 8);
+    if (gid >= n_words) return;
+    const uint blk = gid / 16, k = gid % 16;
+    device const uchar *bp = w + (ulong)blk * BONSAI2_QBYTES;
+    const half d = *(device const half *)bp;
+    const ushort q = ((device const ushort *)(bp + 2))[k];
+    half4 lo, hi;
+    for (short i = 0; i < 4; i++) {
+        lo[i] = (half)((short)((q >> (2 * i)) & 3) - 1) * d;
+        hi[i] = (half)((short)((q >> (2 * (i + 4))) & 3) - 1) * d;
+    }
+    y[2 * (ulong)gid]     = lo;
+    y[2 * (ulong)gid + 1] = hi;
+}
+
+/* ---------------------------------------------------------------------------
  * Blockwise Hadamard.  One 256-thread threadgroup transforms a 1024 block;
  * thread tid holds elements i*256 + tid (i = 0..3) in v[i].  Strides 1..16
  * are lane shuffles, 32..128 go through threadgroup memory, 256 and 512 are

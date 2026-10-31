@@ -48,6 +48,30 @@ typedef struct {
     NSUInteger off;
 } bonsai2_bind;
 
+/* Prefill alternative to the fused PQ2_0 GEMM: unpack the weight to F16 once
+ * per call, then run upstream's F16 GEMM.  The unpack costs about one extra
+ * pass over the F16 matrix, which pays off from about 400 tokens on.  On M4
+ * Pro (High Power Mode) whole-model prefill of a 4069-token prompt measured,
+ * fused -> unpack: 94.0 -> 96.1 t/s at 512-token chunks, 98.9 at 1024, 100.3
+ * at 2048, 100.9 at 4096; a 316-token prompt lost 1.6% and 186 tokens 7.5%.
+ * The scratch holds one matrix and is reused by every call.  Bonsai never
+ * opens a concurrent encoder, so each unpack waits for the previous GEMM. */
+#define BONSAI2_UNPACK_MAX_BYTES (512ull << 20)
+static uint32_t g_bonsai2_unpack_min_tok = 512u;
+static id<MTLBuffer> g_bonsai2_unpack;
+
+void ds4_gpu_bonsai2_set_unpack_min_tokens(uint32_t n_tok) { g_bonsai2_unpack_min_tok = n_tok; }
+
+void ds4_gpu_bonsai2_release(void) { g_bonsai2_unpack = nil; }
+
+static id<MTLBuffer> bonsai2_unpack_scratch(uint64_t bytes) {
+    if (g_bonsai2_unpack && g_bonsai2_unpack.length >= bytes) return g_bonsai2_unpack;
+    g_bonsai2_unpack = [ds4_metal_device() newBufferWithLength:(NSUInteger)bytes
+                                                       options:MTLResourceStorageModePrivate];
+    if (!g_bonsai2_unpack) fprintf(stderr, "ds4: bonsai2 F16 unpack scratch allocation failed\n");
+    return g_bonsai2_unpack;
+}
+
 static int bonsai2_bind_tensor(bonsai2_bind *b, const ds4_gpu_tensor *t, uint64_t bytes,
                                const char *what) {
     if (!t || ds4_gpu_tensor_bytes(t) < bytes) {
@@ -112,6 +136,18 @@ int ds4_gpu_bonsai2_matmul_pq2_tensor(
         !bonsai2_bind_tensor(&b[1], x, (uint64_t)n_tok * in_dim * sizeof(float), "matmul x") ||
         !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "matmul out")) {
         return 0;
+    }
+    const uint64_t f16_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+    if (n_tok > BONSAI2_MV_MAX_TOK && g_bonsai2_unpack_min_tok &&
+        n_tok >= g_bonsai2_unpack_min_tok && f16_bytes <= BONSAI2_UNPACK_MAX_BYTES) {
+        id<MTLBuffer> scratch = bonsai2_unpack_scratch(f16_bytes);
+        if (!scratch) return 0;
+        b[1] = (bonsai2_bind){ scratch, 0 };
+        const uint64_t n_words = (uint64_t)out_dim * (in_dim / 8);
+        return bonsai2_dispatch("kernel_bonsai2_unpack_pq2_f16", &args, sizeof(args), b, 2,
+                                MTLSizeMake((NSUInteger)((n_words + 255) / 256), 1, 1),
+                                MTLSizeMake(256, 1, 1), 0) &&
+               ds4_metal_matmul_f16_buffer(out, scratch, 0, in_dim, out_dim, x, n_tok);
     }
     if (n_tok > BONSAI2_MV_MAX_TOK) {
         return bonsai2_dispatch("kernel_bonsai2_mm_pq2", &args, sizeof(args), b, 3,

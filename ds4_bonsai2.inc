@@ -34,6 +34,7 @@
 static ds4_gpu_tensor *g_bonsai2_sign_gpu[BONSAI2_SIGN_COUNT];
 
 static void bonsai2_gpu_release(void) {
+    ds4_gpu_bonsai2_release();
     for (uint32_t i = 0; i < BONSAI2_SIGN_COUNT; i++) {
         ds4_gpu_tensor_free(g_bonsai2_sign_gpu[i]);
         g_bonsai2_sign_gpu[i] = NULL;

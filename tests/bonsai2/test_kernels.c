@@ -215,6 +215,8 @@ static double row_err(const float *got, const double *want, uint32_t width) {
 
 /* ---- tests ------------------------------------------------------------- */
 
+static const char *g_gemm_label = "gemm";   /* "f16" while the unpack path is on */
+
 static void test_matmul(uint32_t in_dim, uint32_t out_dim, const uint32_t *toks, int n) {
     const uint64_t w_off = map_pq2(in_dim, out_dim);
     for (int c = 0; c < n; c++) {
@@ -227,7 +229,7 @@ static void test_matmul(uint32_t in_dim, uint32_t out_dim, const uint32_t *toks,
         float *y = download(ty, (uint64_t)n_tok * out_dim);
         char what[96];
         snprintf(what, sizeof(what), "matmul %5u -> %6u  n_tok %3u (%s)",
-                 in_dim, out_dim, n_tok, n_tok > 8 ? "gemm" : "mv");
+                 in_dim, out_dim, n_tok, n_tok > 8 ? g_gemm_label : "mv");
         /* Matvec is fp32 throughout; the GEMM rounds activations to half. */
         report(what, check_matmul(g_map + w_off, in_dim, out_dim, x, n_tok, y),
                n_tok > 8 ? 1e-3 : 1e-5);
@@ -695,8 +697,18 @@ int main(int argc, char **argv) {
         bench_matmul(5120, 17408, 4, 64);
         bench_matmul(5120, 17408, 8, 64);
         if (!decode_only) {
-            bench_matmul(5120, 17408, 512, 8);
-            bench_matmul(17408, 5120, 512, 8);
+            /* Prefill: fused PQ2_0 GEMM against unpack + F16 GEMM. */
+            static const uint32_t shapes[][2] = { {5120, 17408}, {17408, 5120}, {5120, 10240}, {6144, 5120} };
+            static const uint32_t toks[] = { 64, 512, 2048 };
+            for (int s = 0; s < 4; s++) {
+                for (int t = 0; t < 3; t++) {
+                    const int it = toks[t] >= 512 ? 4 : 8;
+                    ds4_gpu_bonsai2_set_unpack_min_tokens(0);
+                    printf("  fused "); bench_matmul(shapes[s][0], shapes[s][1], toks[t], it);
+                    ds4_gpu_bonsai2_set_unpack_min_tokens(1);
+                    printf("  f16   "); bench_matmul(shapes[s][0], shapes[s][1], toks[t], it);
+                }
+            }
         }
         ds4_gpu_cleanup();
         return 0;
@@ -713,6 +725,16 @@ int main(int argc, char **argv) {
     test_matmul(5120, 10240, some, 5);
     test_matmul(17408, 5120, down, 5);
     test_matmul(5120, 248320, one, 1);
+    /* The same GEMM shapes through the PQ2_0 -> F16 unpack path. */
+    const uint32_t gemm[] = { 9, 17, 64, 333 };
+    ds4_gpu_bonsai2_set_unpack_min_tokens(1);
+    g_gemm_label = "f16";
+    test_matmul(5120, 248, gemm, 4);
+    test_matmul(6144, 5120, gemm, 4);
+    test_matmul(5120, 10240, gemm, 4);
+    test_matmul(17408, 5120, gemm, 4);
+    ds4_gpu_bonsai2_set_unpack_min_tokens(0);
+    g_gemm_label = "gemm";
 
     test_rotate(6144, 3, 128, 16, 3);
     test_rotate(6144, 3, 0, 0, 0);

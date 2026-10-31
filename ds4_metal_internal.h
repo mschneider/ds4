@@ -30,6 +30,11 @@ NSUInteger ds4_metal_tensor_offset(const ds4_gpu_tensor *tensor);
 id<MTLBuffer> ds4_metal_wrap_model_range(const void *model_map, uint64_t model_size,
                                          uint64_t offset, uint64_t len, uint64_t *inner_offset);
 
+/* Upstream's F16 x F32 GEMM (n_tok > 8 only) on an F16 weight held in a GPU
+ * buffer: out_dim rows of in_dim halves starting at woff. */
+int ds4_metal_matmul_f16_buffer(ds4_gpu_tensor *out, id<MTLBuffer> wbuf, NSUInteger woff,
+                                uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+
 /*
  * Extra Metal source files appended to the single compiled library, as
  * @[@[@"ENV_OVERRIDE_NAME", @"metal/file.metal"], ...].  ds4_metal.m holds a

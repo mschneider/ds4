@@ -39,6 +39,13 @@ int ds4_gpu_bonsai2_matmul_pq2_tensor(
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok);
 
+/* From this many tokens on, the matmul unpacks the weight to F16 in a scratch
+ * buffer and runs upstream's F16 GEMM instead of the fused PQ2_0 GEMM.  0
+ * disables the unpack path.  Default 512; for benchmarks and tests. */
+void ds4_gpu_bonsai2_set_unpack_min_tokens(uint32_t n_tok);
+/* Frees the unpack scratch buffer. */
+void ds4_gpu_bonsai2_release(void);
+
 /* Forward rotation y = H_blk(s ⊙ P x) over rows of `width` (multiple of
  * 1024).  perm_rep > 1 first applies the GDN tiled->grouped head order:
  * x is viewed as [rep][nk][hd] (hd fastest) and read as [nk][rep][hd], i.e.

@@ -61,7 +61,8 @@ graph and these kernels are Bonsai's own:
 
 | Kernel (`metal/bonsai2.metal`) | Role |
 |---|---|
-| `mv_pq2` / `mm_pq2` | PQ2_0 matvec (1–8 tokens) and simdgroup GEMM (prefill) |
+| `mv_pq2` / `mm_pq2` | PQ2_0 matvec (1–8 tokens) and simdgroup GEMM (9–511 tokens) |
+| `unpack_pq2_f16` | PQ2_0 → F16 into a scratch matrix, then upstream's `kernel_mul_mm_f16_f32` (512+ tokens) |
 | `rms_rotate` | RMSNorm, then sign and 1024-FWHT (input of every projection) |
 | `gdn_out_rotate` | GDN head norm with a **silu(z)** gate (Qwen3.8 Flash Next uses sigmoid), tiled→grouped permutation, rotation |
 | `swiglu_rotate`, `rotate`, `unrotate` | FFN down input, attention output input, embedding inverse |
@@ -82,8 +83,31 @@ generated token. The top-5 logprob drift is ≤ 0.012 (gate 0.05).
 
 ## Performance
 
+### Prefill GEMM: fused or unpacked
+
+From 512 tokens on, each projection unpacks its PQ2_0 weight to F16 once and
+runs upstream's F16 GEMM instead of the fused PQ2_0 GEMM. The unpack is one
+extra pass over a matrix of up to 178 MB, and upstream's GEMM is faster at
+large token counts. Whole-model prefill of a 4069-token prompt on the M4 Pro
+below, in High Power Mode on AC, interleaved runs, same greedy output:
+
+| prefill chunk (`DS4_QWEN4_PREFILL_CHUNK`) | fused | unpack + F16 |
+|---|---:|---:|
+| 512 | 94.0 t/s | 96.1 t/s |
+| 1024 | 94.0 t/s | 98.9 t/s |
+| 2048 | 94.1 t/s | 100.3 t/s |
+| 4096 (default 8192 behaves the same) | 94.1 t/s | 100.9 t/s |
+
+Shorter prompts lose with the unpack: 316 tokens 99.0 → 97.4 t/s, 186
+tokens 95.8 → 88.7 t/s. Hence the 512-token threshold
+(`ds4_gpu_bonsai2_set_unpack_min_tokens`). Note that Qwen-family prefill
+chunks come from `DS4_QWEN4_PREFILL_CHUNK`; `--prefill-chunk` does not apply.
+
+### Against PrismML llama.cpp
+
 M4 Pro (16-core GPU, 48 GB) with macOS Low Power Mode on, measured back to
-back with the reference fork on the same machine (`llama-bench -fa 1`):
+back with the reference fork on the same machine (`llama-bench -fa 1`),
+before the unpack path existed:
 
 | | ds4 | PrismML llama.cpp |
 |---|---:|---:|
