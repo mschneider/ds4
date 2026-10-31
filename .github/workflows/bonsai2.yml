@@ -58,7 +58,12 @@ jobs:
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "up to date"; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          branch="sync/upstream-$(date +%Y%m%d)"
+          # Named by the upstream commit, so a second run for the same upstream
+          # (cron plus a manual dispatch) skips instead of failing on the push.
+          branch="sync/upstream-$(git rev-parse --short=12 upstream/main)"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "$branch already exists"; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           git switch -c "$branch"
           git merge --no-edit upstream/main
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -70,12 +75,17 @@ jobs:
           make ds4_test ds4_agent_test
           ./ds4_test --server
           ./ds4_agent_test
+      # Pushes made with GITHUB_TOKEN never trigger other workflows, so this PR
+      # gets no build-test run of its own.  The build and model-free tests
+      # above are its CI: the PR is opened only if they passed, and its body
+      # links this run.
       - name: Open PR
         if: steps.merge.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           git push origin "${{ steps.merge.outputs.branch }}"
           gh pr create --base bonsai2 --head "${{ steps.merge.outputs.branch }}" \
             --title "Merge upstream $(git rev-parse --short upstream/main)" \
-            --body "Automated upstream merge. Before merging, run \`make test-bonsai2-kernels\` and \`make test-bonsai2-reference\` on a Mac (docs/FORK_MAINTAINING.md)."
+            --body "Automated upstream merge. Build and model-free tests passed in $RUN_URL (GitHub starts no CI for PRs opened by this workflow; push a commit to the branch to get one). Before merging, run \`make test-bonsai2-kernels\` and \`make test-bonsai2-reference\` on a Mac (docs/FORK_MAINTAINING.md)."
