@@ -39,7 +39,8 @@ Don't fork the refactored code.
 | | `weights_validate_bonsai2_layout` prototype + dispatch in `weights_validate_layout` |
 | | `#include "ds4_bonsai2_model.inc"` before `config_validate_model`, plus its `qwen35` arch dispatch |
 | | Bonsai branches in `weights_bind_output` and `weights_bind_layer` |
-| | first lines of `qwen4_graph_alloc` and `qwen4_graph_forward_tokens` redirect to Bonsai |
+| | first lines of `qwen4_graph_alloc` and `qwen4_graph_forward_tokens_impl` redirect to Bonsai |
+| | `!ds4_model_is_bonsai2()` in the Qwen PLE prefetch gate of the session prefill. Bonsai has no PLE/n-gram tables, and that path calls `qwen4_graph_stage_inputs` before the redirect. |
 | | `#include "ds4_bonsai2.inc"` after the Qwen3.8 GPU section (`generate_qwen4_metal_argmax`) |
 | | `ds4_engine_routed_quant_bits`: Bonsai reports 2. Without it the KV disk cache never stores Bonsai payloads. |
 | | `qwen4_ref_row`: `DS4_TENSOR_PQ2_0` case |
