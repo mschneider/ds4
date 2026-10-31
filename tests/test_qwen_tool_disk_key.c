@@ -25,6 +25,17 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *t) 
     for (const unsigned char *p = (const unsigned char *)text; *p; p++)
         ds4_tokens_push(t, *p);
 }
+/* Byte tokens have no control spellings, so the trusted mask changes nothing. */
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *t) {
+    (void)trusted;
+    ds4_tokenize_rendered_chat(e, text, t);
+}
+bool ds4_text_has_untrusted_special(ds4_engine *e, const char *text,
+                                    const unsigned char *trusted) {
+    (void)e; (void)text; (void)trusted;
+    return false;
+}
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     (void)e;
     assert(token > 0 && token <= 255);
