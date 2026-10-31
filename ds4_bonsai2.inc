@@ -27,9 +27,18 @@
 #ifdef DS4_HAS_QWEN4_METAL
 #include "ds4_bonsai2_gpu.h"
 
-/* Uploaded once from the validated contract and shared by every session of
- * the process; the model (and so the signs) cannot change underneath them. */
+/* Uploaded on first use from the validated contract and shared by every
+ * session of the engine.  Released on engine close, before ds4_gpu_cleanup
+ * discards all live tensors, so a later engine in the same process uploads
+ * the signs of the model it loaded instead of using stale handles. */
 static ds4_gpu_tensor *g_bonsai2_sign_gpu[BONSAI2_SIGN_COUNT];
+
+static void bonsai2_gpu_release(void) {
+    for (uint32_t i = 0; i < BONSAI2_SIGN_COUNT; i++) {
+        ds4_gpu_tensor_free(g_bonsai2_sign_gpu[i]);
+        g_bonsai2_sign_gpu[i] = NULL;
+    }
+}
 
 static bool bonsai2_signs_ready(void) {
     for (uint32_t i = 0; i < BONSAI2_SIGN_COUNT; i++) {
@@ -326,6 +335,8 @@ static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model
 }
 
 #else /* CUDA builds share the Qwen3.8 graph code but have no Bonsai kernels */
+
+static void bonsai2_gpu_release(void) {}
 
 static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens,
                                 const ds4_qwen4_gpu_graph *shared,

@@ -74162,6 +74162,7 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
+    bonsai2_gpu_release();
     if (e->qwen4_shared_workspace) {
         qwen4_graph_free(e->qwen4_shared_workspace);
         free(e->qwen4_shared_workspace);

@@ -45,6 +45,7 @@ Don't fork the refactored code.
 | | `ds4_engine_routed_quant_bits`: Bonsai reports 2. Without it the KV disk cache never stores Bonsai payloads. |
 | | `qwen4_ref_row`: `DS4_TENSOR_PQ2_0` case |
 | | `ds4_engine_open_internal`: `bonsai2_engine_supported` gate |
+| | `ds4_engine_close`: `bonsai2_gpu_release()` after `qwen4_state_pool_free`, before `ds4_gpu_cleanup` |
 | | `#include "ds4_bonsai2_batch.inc"` and a first-line redirect in `qwen4_graph_encode_native_session_batch` |
 | `ds4.h` | `ds4_engine_is_bonsai2()` |
 | `ds4_metal.m` | include of `ds4_metal_internal.h`, fork sources appended in `ds4_gpu_full_source`, trampoline block at the end |
