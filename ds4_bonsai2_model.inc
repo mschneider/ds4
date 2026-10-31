@@ -129,6 +129,12 @@ static void bonsai2_validate_hadamard(const ds4_model *m) {
 }
 
 static void config_validate_bonsai2_model(const ds4_model *m) {
+    /* Every arch "qwen35" GGUF lands here; only PrismML's ternary files carry
+     * the Hadamard contract this engine needs. */
+    if (!model_find_kv(m, "prism.hadamard.version")) {
+        ds4_die("GGUF arch qwen35 is supported only for Ternary Bonsai 2 (PrismML PQ2_0); "
+                "this file has no prism.hadamard metadata");
+    }
     config_expect_u32("embedding_length", required_u32(m, "qwen35.embedding_length"),
                       DS4_SHAPE_BONSAI2.n_embd);
     g_ds4_shape = DS4_SHAPE_BONSAI2;
