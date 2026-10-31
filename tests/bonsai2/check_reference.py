@@ -23,26 +23,41 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_MODEL = os.path.join(ROOT, "gguf", "ternary-bonsai-2-27b", "Ternary-Bonsai-2-27B-PQ2_0.gguf")
 
 
+def ds4(args, cmd, case):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr[-2000:])
+        raise SystemExit(f"{case['id']}: ds4 exited with {r.returncode}")
+    return r.stdout
+
+
 def run_case(args, case, tmp):
     prompt = os.path.join(tmp, case["id"] + ".txt")
     out = os.path.join(tmp, case["id"] + ".json")
     with open(prompt, "w", encoding="utf-8") as f:
         f.write(case["rendered_prompt"])
+    # --dump-tokens prints one "<id> <piece>" line per prompt token.
+    dump = ds4(args, [args.ds4, "-m", args.model, "--prompt-file", prompt, "--dump-tokens"], case)
+    prompt_ids = [int(line.split()[0]) for line in dump.splitlines()
+                  if line.split() and line.split()[0].isdigit()]
     cmd = [args.ds4, "-m", args.model, "--prompt-file", prompt, "--temp", "0",
            "-n", str(len(case["generated_ids"])), "-c", "8192",
            "--dump-logprobs", out, "--logprobs-top-k", "20"]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0:
-        sys.stderr.write(r.stderr[-2000:])
-        raise SystemExit(f"{case['id']}: ds4 exited with {r.returncode}")
+    ds4(args, cmd, case)
     with open(out, encoding="utf-8") as f:
-        return json.load(f)
+        return prompt_ids, json.load(f)
 
 
-def check(case, got, tol):
+def check(case, result, tol):
+    prompt_ids, got = result
     errors = []
-    if got["prompt_tokens"] != len(case["prompt_ids"]):
-        errors.append(f"prompt is {got['prompt_tokens']} tokens, reference {len(case['prompt_ids'])}")
+    want_prompt = case["prompt_ids"]
+    if prompt_ids != want_prompt:
+        at = next((i for i, (a, b) in enumerate(zip(prompt_ids, want_prompt)) if a != b),
+                  min(len(prompt_ids), len(want_prompt)))
+        errors.append(f"prompt tokens differ at {at} ({len(prompt_ids)} tokens, reference {len(want_prompt)})")
+    if got["prompt_tokens"] != len(prompt_ids):
+        errors.append(f"generation saw {got['prompt_tokens']} prompt tokens, --dump-tokens {len(prompt_ids)}")
     ids = [s["selected"]["id"] for s in got["steps"]]
     want = case["generated_ids"]
     first = next((i for i, (a, b) in enumerate(zip(ids, want)) if a != b), None)
