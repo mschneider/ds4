@@ -43,6 +43,13 @@ test-bonsai2-reference: ds4
 # with llama.cpp only to 3e-3, which reaches 0.1-0.35 in top-5 logprobs
 # (docs/QWEN38_27B.md).
 QWEN38_27B_MODEL ?= gguf/qwen38-27b/Qwen3.8-27B-Q4KM-Q8.gguf
+# Quality against a reference model (docs/QWEN38_27B.md, Quality).
+tests/qwen38_27b/kld.o: tests/qwen38_27b/kld.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/qwen38_27b/kld: tests/qwen38_27b/kld.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 .PHONY: test-qwen38-27b-reference
 test-qwen38-27b-reference: ds4
 	./tests/bonsai2/check_reference.py --model $(QWEN38_27B_MODEL) \
@@ -55,6 +62,7 @@ ds4.o ds4_cpu.o: ds4_bonsai2_shape.inc ds4_bonsai2_model.inc ds4_bonsai2.inc ds4
 .PHONY: fork-clean
 clean: fork-clean
 fork-clean:
-	rm -f ds4_metal_bonsai2.o tests/bonsai2/test_kernels tests/bonsai2/test_kernels.o
+	rm -f ds4_metal_bonsai2.o tests/bonsai2/test_kernels tests/bonsai2/test_kernels.o \
+		tests/qwen38_27b/kld tests/qwen38_27b/kld.o
 
 .DEFAULT_GOAL := $(FORK_SAVED_DEFAULT_GOAL)

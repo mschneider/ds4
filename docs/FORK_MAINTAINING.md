@@ -36,6 +36,7 @@ Don't fork the refactored code.
 | File | Hook |
 |---|---|
 | `Makefile` | `include fork.mk` after the platform `CORE_OBJS` lists |
+| `gguf-tools/Makefile` | `ds4_metal_bonsai2.o` appended to the Darwin `QUALITY_TARGETS`/`QUALITY_OBJS`, so `score_official` links |
 | `ds4.c` | `DS4_VARIANT_BONSAI2 = 200`, `DS4_VARIANT_QWEN38_27B = 201`. Fork variants start at 200 so they never share a KV-cache model id with upstream. |
 | | `#include "ds4_bonsai2_shape.inc"` after `ds4_qwen4_layer_is_nextn` |
 | | `gguf_types[142]` and `DS4_TENSOR_PQ2_0 = 142` |

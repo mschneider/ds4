@@ -15,6 +15,10 @@ read as BF16/F16/F32 (or Q6_K) and quantized in row chunks with the shared
 native quantizer (make -C gguf-tools quants-shared) on a thread pool, so
 memory stays bounded.
 
+--imatrix reads a llama.cpp GGUF imatrix (llama-imatrix on the Q8_0 recipe)
+and weights each requantized projection's columns by its mean squared
+activation.  The MTP layer has none, since llama-imatrix never runs it.
+
 --mtp adds the MTP layer from llama.cpp's MTP GGUF (mtp-Qwen3.8-27B-BF16.gguf)
 as block 64, under the same type rules; its copies of token_embd and output
 are dropped, since the layer shares the main model's.
@@ -51,6 +55,15 @@ CHUNK_ROWS = 1024
 PROJECTIONS = ("attn_qkv", "attn_gate", "ssm_out", "attn_q", "attn_k", "attn_v",
                "attn_output", "ffn_gate", "ffn_up", "ffn_down", "nextn.eh_proj")
 
+# --set CLASS=TYPE overrides --proj/--embd for one class of tensors
+CLASSES = {
+    "ffn": ("ffn_gate", "ffn_up", "ffn_down"),
+    "gdn": ("attn_qkv", "attn_gate", "ssm_out"),
+    "attn": ("attn_q", "attn_k", "attn_v", "attn_output"),
+    "head": ("output",),
+    "embd": ("token_embd",),
+}
+
 
 def target_type(name: str, src_type: int, args) -> int:
     base = name.split(".", 2)[-1] if name.startswith("blk.") else name
@@ -58,6 +71,12 @@ def target_type(name: str, src_type: int, args) -> int:
         return QTYPES[args.gates]
     if args.keep_quantized and src_type in (T_Q8_0, T_Q4_K):
         return src_type
+    stem = base[:-len(".weight")] if base.endswith(".weight") else base
+    for cls, stems in CLASSES.items():
+        if cls in args.set and stem in stems and not name.startswith(f"blk.{args.mtp_layer}."):
+            return QTYPES[args.set[cls]]
+    if args.set.get("mtp") and name.startswith(f"blk.{args.mtp_layer}.") and stem in PROJECTIONS:
+        return QTYPES[args.set["mtp"]]
     if name == "token_embd.weight":
         return QTYPES[args.embd]
     if name == "output.weight" or base in (p + ".weight" for p in PROJECTIONS):
@@ -112,7 +131,25 @@ def float_rows(raw: bytes, t: int, width: int) -> np.ndarray:
     return v.reshape(-1, width)
 
 
-def encode(rows: np.ndarray, t: int, q: GGMLQuantizer) -> bytes:
+def load_imatrix(path: str) -> dict:
+    """weight name -> per-column importance: in_sum2 / counts."""
+    r = Reader(path)
+    out = {}
+    for name in r.tensors:
+        if not name.endswith(".in_sum2"):
+            continue
+        base = name[:-len(".in_sum2")]
+        sums = r.read_scalar_tensor(name, "in_sum2").astype(np.float64)
+        counts = r.read_scalar_tensor(base + ".counts", "counts").astype(np.float64)
+        if counts.size != 1 or counts[0] <= 0:
+            raise SystemExit(f"imatrix {base}: unsupported counts layout")
+        out[base] = (sums / counts[0]).astype(np.float32)
+    if not out:
+        raise SystemExit(f"{path} holds no in_sum2 tensors")
+    return out
+
+
+def encode(rows: np.ndarray, t: int, q: GGMLQuantizer, imatrix=None) -> bytes:
     if t == T_F32:
         return np.ascontiguousarray(rows, dtype="<f4").tobytes()
     if t == T_F16:
@@ -121,7 +158,7 @@ def encode(rows: np.ndarray, t: int, q: GGMLQuantizer) -> bytes:
         u = np.ascontiguousarray(rows, dtype="<f4").view("<u4")
         return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2").tobytes()
     name = next(k for k, v in QTYPES.items() if v == t)
-    return q.encode(rows, name)
+    return q.encode(rows, name, imatrix=imatrix)
 
 
 def main() -> int:
@@ -134,13 +171,25 @@ def main() -> int:
     ap.add_argument("--keep-quantized", action="store_true",
                     help="copy Q4_K/Q8_0 source tensors unchanged")
     ap.add_argument("--mtp", help="llama.cpp MTP GGUF to merge as block 64")
+    ap.add_argument("--imatrix", help="llama.cpp GGUF imatrix for the requantized projections")
+    ap.add_argument("--set", action="append", default=[], metavar="CLASS=TYPE",
+                    help="type for one class: " + ", ".join(CLASSES) + ", mtp (repeatable)")
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--quants-lib", default=str(default_quantizer_library()))
     args = ap.parse_args()
 
+    sets = {}
+    for item in args.set:
+        cls, _, typ = item.partition("=")
+        if (cls not in CLASSES and cls != "mtp") or typ not in QTYPES:
+            raise SystemExit(f"bad --set {item}")
+        sets[cls] = typ
+    args.set = sets
     src = Reader(args.src)
     if src.kv.get("general.architecture") != "qwen35":
         raise SystemExit("source is not a qwen35 GGUF")
+    args.mtp_layer = src.kv["qwen35.block_count"]
+    imatrix = load_imatrix(args.imatrix) if args.imatrix else {}
     q = GGMLQuantizer(args.quants_lib)
 
     plan = []
@@ -149,6 +198,10 @@ def main() -> int:
     kv = dict(src.kv)
     kv_types = dict(src.kv_types)
     recipe = f"proj={args.proj} embd={args.embd} gates={args.gates}"
+    for cls, typ in sorted(args.set.items()):
+        recipe += f" {cls}={typ}"
+    if args.imatrix:
+        recipe += f" imatrix={Path(args.imatrix).name}"
     if args.keep_quantized:
         recipe += " keep-quantized"
     if args.mtp:
@@ -190,13 +243,19 @@ def main() -> int:
             width = dims[0]
             rows = nbytes(t, dims) // nbytes(t, [width])
             src_row = nbytes(t, [width])
+            im = imatrix.get(name) if tt in (T_Q4_K,) else None
+            if im is not None and im.size != width:
+                raise SystemExit(f"imatrix width {im.size} does not match {name}")
+            if tt == T_Q4_K and imatrix and im is None and not name.startswith(f"blk.{args.mtp_layer}.") \
+                    and name != "token_embd.weight":
+                print(f"warning: no imatrix entry for {name}", flush=True)
             rd.f.seek(rd.data_start + toff)
             written = 0
             for w0 in range(0, rows, CHUNK_ROWS * args.threads):
                 chunks = [rd.f.read(min(CHUNK_ROWS, rows - r0) * src_row)
                           for r0 in range(w0, min(rows, w0 + CHUNK_ROWS * args.threads), CHUNK_ROWS)]
                 blobs = chunks if tt == t else pool.map(
-                    lambda raw: encode(float_rows(raw, t, width), tt, q), chunks)
+                    lambda raw: encode(float_rows(raw, t, width), tt, q, im), chunks)
                 for blob in blobs:
                     out.write(blob)
                     written += len(blob)
