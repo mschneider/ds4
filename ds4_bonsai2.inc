@@ -52,19 +52,30 @@ static bool bonsai2_signs_ready(void) {
 
 
 /* A projection, by weight type: PQ2_0 (Bonsai), Q4_K, or the Qwen3.8 dense
- * types (Q8_0, Q4_0, BF16, F16, F32). */
-static bool bonsai2_mm(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
-                       const ds4_gpu_tensor *x, uint32_t T) {
-    if (w->type != DS4_TENSOR_PQ2_0 && w->type != DS4_TENSOR_Q4_K) return qwen4_gemv(out, m, w, x, T);
-    const uint32_t in = (uint32_t)w->dim[0], rows = (uint32_t)w->dim[1];
+ * types (Q8_0, Q4_0, BF16, F16, F32).  rows (0: all) keeps a leading prefix
+ * of the output rows, for the MTP draft head.  Q4_K takes the classic
+ * matvec for one or two rows (one pass each, so a two-row verify row is
+ * bit-identical to a decode step) and the simdgroup-matrix product for
+ * 3-8, where it is cheaper. */
+static bool bonsai2_mm_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                            const ds4_gpu_tensor *x, uint32_t T, uint32_t rows) {
+    if (!rows || rows > w->dim[1]) rows = (uint32_t)w->dim[1];
+    if (w->type != DS4_TENSOR_PQ2_0 && w->type != DS4_TENSOR_Q4_K) return qwen4_gemv_rows(out, m, w, x, T, rows);
+    const uint32_t in = (uint32_t)w->dim[0];
     const int ok = w->type == DS4_TENSOR_PQ2_0
         ? ds4_gpu_bonsai2_matmul_pq2_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T)
-        : ds4_gpu_bonsai2_matmul_q4k_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T) ||
+        : (T >= 3u && T <= 8u &&
+           ds4_gpu_bonsai2_mm_q4k_rows_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T)) ||
           ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in, rows, x, T);
     if (ok) return true;
     fprintf(stderr, "ds4: qwen35 matmul failed for %.*s (type %u, %u tokens)\n",
             (int)w->name.len, w->name.ptr, w->type, T);
     return false;
+}
+
+static bool bonsai2_mm(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                       const ds4_gpu_tensor *x, uint32_t T) {
+    return bonsai2_mm_rows(out, m, w, x, T, 0u);
 }
 
 /* Normed hidden state into g->mixed.  Bonsai rotates it for the PQ2_0
@@ -118,11 +129,16 @@ static ds4_gpu_tensor *bonsai2_alloc_f32(uint64_t n) {
     return qwen4_graph_alloc_f32(n ? n : 1u);
 }
 
-static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens,
+/* Rows per MTP pass: drafts and verify catch-ups use 1-3, prefill fills the
+ * MTP layer's KV cache in slices of this many. */
+#define BONSAI2_MTP_ROWS 64u
+
+static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp,
                                 const ds4_qwen4_gpu_graph *shared,
                                 ds4_gpu_tensor *const *state_pool, ds4_gpu_tensor *const *hist_pool,
                                 uint32_t slot) {
     memset(g, 0, sizeof(*g));
+    mtp = mtp && DS4_N_NEXTN_PREDICT != 0 && cap_tokens >= 3u;
     if (ds4_model_is_bonsai2() && !bonsai2_signs_ready()) {
         fprintf(stderr, "ds4: Bonsai Hadamard signs are not available\n");
         return false;
@@ -134,7 +150,7 @@ static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     g->ctx_cap = ctx_cap;
     g->cap_tokens = cap_tokens;
-    g->n_logit_rows = 1;
+    g->n_logit_rows = mtp ? 3u : 1u;
     /* the session arena compares block capacities; Bonsai has no blocks but
      * keeps the Qwen3.8 value so arena reuse follows the same rule */
     g->n_block_cap = ctx_cap / 4u + 1u;
@@ -172,7 +188,23 @@ static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32
     /* Inert Qwen3.8 state: the payload and reset code walk these with zero
      * sizes (no PLE history, zero-width indexer keys) but expect tensors. */
     BONSAI2_ALLOC(ple_hist, 1);
-    BONSAI2_ALLOC(logits, DS4_N_VOCAB);
+    BONSAI2_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
+    /* MTP: the predictor's inputs and residual for up to three rows, and the
+     * recurrent snapshots the speculative cycle swaps in on a rejection
+     * (after verify row 0, after row 1, and before the block for exact
+     * sampling).  Flash Next sizes the snapshot sets lazily from its PLE
+     * history, which is empty here, so all three are allocated now: 3 x 151
+     * MB of GDN state and conv history. */
+    if (mtp) {
+        BONSAI2_ALLOC(mtp_e, BONSAI2_MTP_ROWS * E);
+        BONSAI2_ALLOC(mtp_cat, BONSAI2_MTP_ROWS * 2u * E);
+        BONSAI2_ALLOC(mtp_R, BONSAI2_MTP_ROWS * E);
+        BONSAI2_ALLOC(mtp_argmax, 1);
+        BONSAI2_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 2u);
+        BONSAI2_ALLOC(snap_ple_hist, 1);
+        BONSAI2_ALLOC(snap2_ple_hist, 1);
+        BONSAI2_ALLOC(snap0_ple_hist, 1);
+    }
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
@@ -187,6 +219,14 @@ static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32
                 g->layer_lin_hist[il] = bonsai2_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
             }
             ok = g->layer_lin_state[il] && g->layer_lin_hist[il];
+            if (ok && mtp) {
+                BONSAI2_ALLOC(snap_lin_state[il], v_dim * DS4_N_LIN_HEAD_DIM);
+                BONSAI2_ALLOC(snap_lin_hist[il], (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+                BONSAI2_ALLOC(snap2_lin_state[il], v_dim * DS4_N_LIN_HEAD_DIM);
+                BONSAI2_ALLOC(snap2_lin_hist[il], (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+                BONSAI2_ALLOC(snap0_lin_state[il], v_dim * DS4_N_LIN_HEAD_DIM);
+                BONSAI2_ALLOC(snap0_lin_hist[il], (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+            }
         } else {
             g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
             g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
@@ -199,7 +239,7 @@ static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32
     g->pos3 = bonsai2_alloc_f32((uint64_t)ctx_cap * 4u);
     ok = ok && g->pos3;
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
-    g->host_logits = xmalloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+    g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
     if (!ok) {
         fprintf(stderr, "ds4: %s graph allocation failed (ctx %u)\n", g_ds4_shape.name, ctx_cap);
         qwen4_graph_free(g);
@@ -253,6 +293,15 @@ static bool bonsai2_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
         else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
+        /* what a snapshot restore puts back besides the recurrent state */
+        if (t == 0 && g->snap_after_first) {
+            g->snap_mrope_delta = g->mrope_delta;
+            g->snap_pos = g->pos + 1u;
+        }
+        if (t == 1u && g->snap_after_second) {
+            g->snap2_mrope_delta = g->mrope_delta;
+            g->snap2_pos = g->pos + 2u;
+        }
     }
     return ds4_gpu_tensor_write(g->R, 0, g->host_row, (uint64_t)T * E * sizeof(float)) &&
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
@@ -281,17 +330,41 @@ static bool bonsai2_gates(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_
 static bool bonsai2_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                  uint32_t il, uint32_t T) {
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
+    /* During an MTP verify the conv history and the scan state are saved
+     * right after rows 0 and 1, so a rejected draft only swaps them in. */
+    ds4_gpu_tensor *snap_hist = g->snap_after_first ? g->snap_lin_hist[il] : NULL;
+    ds4_gpu_tensor *snap2_hist = g->snap_after_second ? g->snap2_lin_hist[il] : NULL;
+    ds4_gpu_tensor *snap_state = g->snap_after_first ? g->snap_lin_state[il] : NULL;
+    ds4_gpu_tensor *snap2_state = g->snap_after_second ? g->snap2_lin_state[il] : NULL;
     ds4_gpu_tensor *out_in = NULL;
-    return bonsai2_mm(g->qkv, m, l->lin_qkv, g->mixed, T) &&
-           bonsai2_mm(g->z, m, l->lin_gate, g->mixed, T) &&
-           bonsai2_gates(g, m, l, T) &&
-           ds4_gpu_qwen4_conv_stream_tensor(g->qkv, g->layer_lin_hist[il], m->map, m->size,
-                                            l->lin_conv->abs_offset, T, DS4_N_LIN_CONV_DIM,
-                                            DS4_N_LIN_CONV, true) &&
-           ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size, l->lin_a->abs_offset,
-                                         l->lin_dt_bias->abs_offset, T, Hk, Hv, D) &&
+    if (!bonsai2_mm(g->qkv, m, l->lin_qkv, g->mixed, T) || !bonsai2_mm(g->z, m, l->lin_gate, g->mixed, T)) {
+        return false;
+    }
+    /* Plain decode and verify steps (1-3 rows) take Flash Next's fused
+     * front: alpha/beta, conv with history snapshots and prep in one
+     * dispatch, the same arithmetic for every row count.  Bonsai's gates read
+     * the unrotated xn, which the front does not take. */
+    bool front;
+    if (!ds4_model_is_bonsai2() && T <= 3u && l->lin_alpha->type == l->lin_beta->type) {
+        front = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb,
+                                               m->map, m->size, l->lin_conv->abs_offset,
+                                               l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
+                                               l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                               l->lin_alpha->type, T, Hk, Hv, D, DS4_N_LIN_CONV, DS4_N_EMBD,
+                                               snap_hist, 0u, snap2_hist, 1u) != 0;
+    } else if (snap_hist || snap2_hist) {
+        return false;   /* only the fused front saves conv history */
+    } else {
+        front = bonsai2_gates(g, m, l, T) &&
+                ds4_gpu_qwen4_conv_stream_tensor(g->qkv, g->layer_lin_hist[il], m->map, m->size,
+                                                 l->lin_conv->abs_offset, T, DS4_N_LIN_CONV_DIM,
+                                                 DS4_N_LIN_CONV, true) &&
+                ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size, l->lin_a->abs_offset,
+                                              l->lin_dt_bias->abs_offset, T, Hk, Hv, D);
+    }
+    return front &&
            ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb,
-                                         T, Hk, Hv, D, NULL, 0u, NULL, 1u) &&
+                                         T, Hk, Hv, D, snap_state, 0u, snap2_state, 1u) &&
            (out_in = bonsai2_gdn_out(g, m, l, T)) &&
            bonsai2_mm(g->blk, m, l->lin_out, out_in, T);
 }
@@ -338,8 +411,20 @@ static bool bonsai2_flush_after(uint32_t il) {
     return il == 1u || il == 9u || il == 25u;
 }
 
-/* Same contract as qwen4_graph_forward_tokens.  Neither variant drafts with
- * MTP yet, so only the last row's logits are ever requested. */
+static bool bonsai2_mtp_pass(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             ds4_gpu_tensor *src, uint32_t src_row, const ds4_tensor *src_norm,
+                             const int *next_tokens, uint32_t T, uint32_t idx, float *logits_out,
+                             int *draft_out);
+
+/* Same contract as qwen4_graph_forward_tokens: the trunk layers only (the
+ * MTP layer runs in bonsai2_graph_mtp_steps), logits for the last row or,
+ * for MTP verifies, every row.
+ *
+ * With MTP, a prefill also runs the MTP layer over every row whose next
+ * token it already holds, as llama.cpp does, so drafts attend over a filled
+ * cache rather than empty prompt rows: on the code reference prompt this
+ * lifts acceptance from 67% to 81%.  The last row of a chunk waits for its
+ * token; at a chunk boundary that one row stays unfilled. */
 static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                          const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
@@ -352,8 +437,10 @@ static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model
     }
     const uint32_t pos0 = g->pos, E = DS4_N_EMBD;
     if (!bonsai2_stage_inputs(g, m, w, tokens, T) || !glm_graph_begin_commands_if_needed()) return false;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const bool verify = g->snap_after_first || g->snap_after_second;
     bool ok = bonsai2_embed_finish(g, T);
-    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+    for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         ok = bonsai2_norm(g, m, l->attn_norm, g->R, g->xn, T) &&
              (ds4_qwen4_layer_is_linear(il) ? bonsai2_graph_linear(g, m, l, il, T)
@@ -365,28 +452,156 @@ static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model
              qwen4_graph_apply_steering_ffn(g, il, T);
         if (ok && bonsai2_flush_after(il)) ok = ds4_gpu_flush_commands() != 0;
     }
+    const uint32_t rows = all_rows ? T : 1u;
     if (ok && logits_out) {
-        ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * E * sizeof(float),
-                                                   (uint64_t)E * sizeof(float));
-        ok = last && bonsai2_norm(g, m, w->output_norm, last, NULL, 1) &&
-             bonsai2_mm(g->logits, m, w->output, g->mixed, 1);
-        ds4_gpu_tensor_free(last);
+        ds4_gpu_tensor *tail = ds4_gpu_tensor_view(g->R, (uint64_t)(T - rows) * E * sizeof(float),
+                                                   (uint64_t)rows * E * sizeof(float));
+        ok = tail && bonsai2_norm(g, m, w->output_norm, tail, NULL, rows) &&
+             bonsai2_mm(g->logits, m, w->output, g->mixed, rows);
+        ds4_gpu_tensor_free(tail);
+    }
+    for (uint32_t r = 0; ok && g->mtp_R && !verify && r + 1u < T; r += BONSAI2_MTP_ROWS) {
+        const uint32_t n = T - 1u - r < BONSAI2_MTP_ROWS ? T - 1u - r : BONSAI2_MTP_ROWS;
+        ok = bonsai2_mtp_pass(g, m, w, g->R, r, w->output_norm, tokens + r + 1u, n, pos0 + r, NULL, NULL);
     }
     if (!ds4_gpu_end_commands()) ok = false;
     if (ok && logits_out) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (ok) g->pos += T;
+    if (g->snap_after_first) g->snap_valid = ok;
+    if (g->snap_after_second) g->snap2_valid = ok;
+    g->snap_after_first = g->snap_after_second = false;
     return ok;
+}
+
+/* One causal pass of the MTP layer (the last layer, past the trunk) over T
+ * rows at its KV index idx, as llama.cpp's qwen35 graph_mtp:
+ *
+ *   x = eh_proj([enorm(embd(next_tokens[t])), hnorm(src_norm(h[t]))])
+ *   x += attention(attn_norm(x))          own KV cache, rope at idx + t
+ *   x += ffn(post_attention_norm(x))
+ *   draft = argmax(output(shared_head_norm(x[T-1])))
+ *
+ * h[t] is row src_row + t of src: the trunk residual (src_norm output_norm)
+ * when catching up on verified rows, or the predictor's own last row
+ * (src_norm shared_head_norm) when chaining a second draft.  The residual
+ * stays in mtp_R for the chain.  Positions past the trunk's get text rope
+ * positions here; the trunk rewrites them when it gets there.  Without
+ * draft_out and logits_out the pass only writes the layer's KV rows (prefill)
+ * and leaves the command batch open. */
+static bool bonsai2_mtp_pass(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             ds4_gpu_tensor *src, uint32_t src_row, const ds4_tensor *src_norm,
+                             const int *next_tokens, uint32_t T, uint32_t idx, float *logits_out,
+                             int *draft_out) {
+    const uint32_t E = DS4_N_EMBD, il = DS4_N_LAYER - 1u;
+    const ds4_layer_weights *l = &w->layer[il];
+    const bool head = logits_out || draft_out;
+    if (!g->mtp_R || !src || T == 0u || T > BONSAI2_MTP_ROWS || T > g->cap_tokens || idx > g->ctx_cap ||
+        T > g->ctx_cap - idx) {
+        return false;
+    }
+    for (uint32_t t = 0; t < T; t++) {
+        if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+    }
+    if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
+    int32_t delta = g->mrope_delta;
+    for (uint32_t p = idx; p < idx + T; p++) {
+        if (p < g->pos) continue;
+        uint32_t pos3[4] = {0};
+        qwen4_mrope_pos(NULL, 0, p, &delta, pos3);
+        if (!ds4_gpu_tensor_write(g->pos3, (uint64_t)p * 16u, pos3, 16u)) return false;
+    }
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    const uint64_t row = (uint64_t)E * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *e = ds4_gpu_tensor_view(g->mtp_e, t * row, row);
+        ds4_gpu_tensor *h = ds4_gpu_tensor_view(src, (uint64_t)(src_row + t) * row, row);
+        ds4_gpu_tensor *hn = ds4_gpu_tensor_view(g->xn, t * row, row);
+        ds4_gpu_tensor *cat_e = ds4_gpu_tensor_view(g->mtp_cat, 2u * t * row, row);
+        ds4_gpu_tensor *cat_h = ds4_gpu_tensor_view(g->mtp_cat, (2u * t + 1u) * row, row);
+        ok = e && h && hn && cat_e && cat_h &&
+             ds4_gpu_rms_norm_weight_rows_tensor(cat_e, e, m->map, m->size, l->nextn_enorm->abs_offset,
+                                                 E, 1, DS4_RMS_EPS) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(hn, h, m->map, m->size, src_norm->abs_offset,
+                                                 E, 1, DS4_RMS_EPS) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(cat_h, hn, m->map, m->size, l->nextn_hnorm->abs_offset,
+                                                 E, 1, DS4_RMS_EPS);
+        ds4_gpu_tensor_free(cat_h);
+        ds4_gpu_tensor_free(cat_e);
+        ds4_gpu_tensor_free(hn);
+        ds4_gpu_tensor_free(h);
+        ds4_gpu_tensor_free(e);
+    }
+    ds4_gpu_tensor *R_save = g->R;
+    ok = ok && bonsai2_mm(g->mtp_R, m, l->nextn_eh_proj, g->mtp_cat, T);
+    g->R = g->mtp_R;
+    ok = ok && bonsai2_norm(g, m, l->attn_norm, g->R, g->xn, T) &&
+         bonsai2_graph_attention(g, m, l, il, idx, T) &&
+         ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E) &&
+         bonsai2_graph_ffn(g, m, l, T) &&
+         ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E);
+    g->R = R_save;
+    /* the draft needs only its argmax; DS4_QWEN4_MTP_DRAFT_ROWS scores the
+     * frequent-token prefix, as for Flash Next */
+    if (!head) {
+        if (ok) {
+            g->mtp_pos = idx + T;
+            g->mtp_last_rows = 0;   /* no chain from a fill pass */
+        }
+        return ok;
+    }
+    const uint32_t head_rows = logits_out ? DS4_N_VOCAB : qwen4_mtp_draft_rows();
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->mtp_R, (uint64_t)(T - 1u) * row, row);
+    ok = ok && last && bonsai2_norm(g, m, l->nextn_shared_head_norm, last, NULL, 1) &&
+         bonsai2_mm_rows(g->logits, m, w->output, g->mixed, 1, head_rows) &&
+         (logits_out || ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, head_rows));
+    ds4_gpu_tensor_free(last);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok && draft_out) *draft_out = sample_argmax(logits_out, DS4_N_VOCAB);
+    } else if (ok && draft_out) {
+        int32_t token = -1;
+        ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0 &&
+             token >= 0 && (uint32_t)token < head_rows;
+        if (ok) *draft_out = token;
+    }
+    if (ok) {
+        g->mtp_pos = idx + T;
+        g->mtp_last_rows = T;
+    }
+    return ok;
+}
+
+/* qwen4_graph_mtp_steps for this family: rows row.. of the last trunk
+ * forward, catching up on verified tokens and drafting after the last. */
+static bool bonsai2_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                    uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx,
+                                    bool want_logits, float *logits_out, int *draft_out) {
+    if (!want_logits || T > 3u) return false;   /* no batched predictor for this family */
+    return bonsai2_mtp_pass(g, m, w, g->R, row, w->output_norm, next_tokens, T, idx, logits_out, draft_out);
+}
+
+/* qwen4_graph_mtp_chain_step: one more draft from the predictor's own last
+ * row, a proposal the next verify checks like any other. */
+static bool bonsai2_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                         int next_token, uint32_t idx, int *draft_out) {
+    if (g->mtp_last_rows == 0u || g->mtp_last_rows > 3u) return false;
+    const ds4_layer_weights *l = &w->layer[DS4_N_LAYER - 1u];
+    return bonsai2_mtp_pass(g, m, w, g->mtp_R, g->mtp_last_rows - 1u, l->nextn_shared_head_norm,
+                            &next_token, 1u, idx, NULL, draft_out);
 }
 
 #else /* CUDA builds share the Qwen3.8 graph code but have no qwen35 kernels */
 
-static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens,
+static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp,
                                 const ds4_qwen4_gpu_graph *shared,
                                 ds4_gpu_tensor *const *state_pool, ds4_gpu_tensor *const *hist_pool,
                                 uint32_t slot) {
-    (void)ctx_cap; (void)cap_tokens; (void)shared; (void)state_pool; (void)hist_pool; (void)slot;
+    (void)ctx_cap; (void)cap_tokens; (void)mtp; (void)shared; (void)state_pool; (void)hist_pool; (void)slot;
     memset(g, 0, sizeof(*g));
     fprintf(stderr, "ds4: %s needs the Metal backend\n", g_ds4_shape.name);
     return false;
@@ -395,6 +610,20 @@ static bool bonsai2_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32
 static bool bonsai2_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                          const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     (void)g; (void)m; (void)w; (void)tokens; (void)T; (void)logits_out; (void)all_rows;
+    return false;
+}
+
+static bool bonsai2_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                    uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx,
+                                    bool want_logits, float *logits_out, int *draft_out) {
+    (void)g; (void)m; (void)w; (void)row; (void)next_tokens; (void)T; (void)idx; (void)want_logits;
+    (void)logits_out; (void)draft_out;
+    return false;
+}
+
+static bool bonsai2_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                         int next_token, uint32_t idx, int *draft_out) {
+    (void)g; (void)m; (void)w; (void)next_token; (void)idx; (void)draft_out;
     return false;
 }
 

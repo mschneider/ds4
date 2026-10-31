@@ -275,27 +275,23 @@ int ds4_gpu_bonsai2_gdn_out_rotate_tensor(
                             bonsai2_block_grid(n_tok, width), MTLSizeMake(256, 1, 1), 0);
 }
 
-/* Must match struct bonsai2_q4k_args in metal/bonsai2.metal. */
+/* Must match struct bonsai2_q4k_mm_args in metal/bonsai2.metal. */
 typedef struct {
     uint32_t in_dim;
     uint32_t out_dim;
     uint32_t row_bytes;
-} bonsai2_q4k_args;
+    uint32_t n_tok;
+} bonsai2_q4k_mm_args;
 
-int ds4_gpu_bonsai2_matmul_q4k_tensor(
+int ds4_gpu_bonsai2_mm_q4k_rows_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok) {
-    if (n_tok == 0 || n_tok > 8 || in_dim == 0 || in_dim % 256 != 0 || out_dim == 0 ||
-        out_dim % 4 != 0 || !ds4_gpu_init()) {
+    if (n_tok == 0 || n_tok > 8 || in_dim == 0 || in_dim % 256 != 0 || out_dim == 0 || !ds4_gpu_init()) {
         return 0;
     }
     const uint32_t row_bytes = in_dim / 256 * 144;
-    const bonsai2_q4k_args args = { in_dim, out_dim, row_bytes };
-    static const char *const names[4] = {
-        "kernel_bonsai2_mv_q4k_1", "kernel_bonsai2_mv_q4k_2",
-        "kernel_bonsai2_mv_q4k_3", "kernel_bonsai2_mv_q4k_4",
-    };
+    const bonsai2_q4k_mm_args args = { in_dim, out_dim, row_bytes, n_tok };
     bonsai2_bind b[3];
     if (!bonsai2_bind_model(&b[0], model_map, model_size, weight_offset,
                             (uint64_t)out_dim * row_bytes, "Q4_K weight") ||
@@ -303,18 +299,8 @@ int ds4_gpu_bonsai2_matmul_q4k_tensor(
         !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "q4k out")) {
         return 0;
     }
-    /* rows past four go in a second pass over views of x and out */
-    for (uint32_t t0 = 0; t0 < n_tok; t0 += 4) {
-        const uint32_t nt = n_tok - t0 < 4 ? n_tok - t0 : 4;
-        bonsai2_bind bt[3] = { b[0], b[1], b[2] };
-        bt[1].off += (NSUInteger)t0 * in_dim * sizeof(float);
-        bt[2].off += (NSUInteger)t0 * out_dim * sizeof(float);
-        if (!bonsai2_dispatch(names[nt - 1], &args, sizeof(args), bt, 3,
-                              MTLSizeMake(out_dim / 4, 1, 1), MTLSizeMake(32, 2, 1), 0)) {
-            return 0;
-        }
-    }
-    return 1;
+    return bonsai2_dispatch("kernel_bonsai2_mm_q4k_rows_r1", &args, sizeof(args), b, 3,
+                            MTLSizeMake((out_dim + 31) / 32, 1, 1), MTLSizeMake(32, 4, 1), 0);
 }
 
 /* Must match struct bonsai2_gdn_out_args in metal/bonsai2.metal. */

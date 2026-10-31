@@ -733,7 +733,7 @@ static void q4k_row(const uint8_t *w, uint32_t in_dim, uint32_t o, double *dst) 
     }
 }
 
-static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *toks, int n) {
+static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *toks, int n, int mma) {
     const uint64_t w_off = map_q4k(in_dim, out_dim);
     double *wr = malloc((uint64_t)in_dim * sizeof(double));
     for (int c = 0; c < n; c++) {
@@ -741,8 +741,10 @@ static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *t
         float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
         ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
         ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
-        require_ok(ds4_gpu_bonsai2_matmul_q4k_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim,
-                                                     tx, n_tok), "bonsai2 q4k matmul");
+        require_ok(mma ? ds4_gpu_bonsai2_mm_q4k_rows_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim,
+                                                            tx, n_tok)
+                       : ds4_gpu_matmul_quant_tensor(ty, g_map, g_map_size, w_off, 12u, in_dim, out_dim,
+                                                     tx, n_tok), "q4k matmul");
         float *y = download(ty, (uint64_t)n_tok * out_dim);
         const uint32_t stride = out_dim > 4096 ? 37u : 1u;
         double err = 0.0;
@@ -761,7 +763,8 @@ static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *t
             }
         }
         char what[96];
-        snprintf(what, sizeof(what), "q4k mv %5u -> %6u  n_tok %u", in_dim, out_dim, n_tok);
+        snprintf(what, sizeof(what), "q4k %s %5u -> %6u  n_tok %u", mma ? "mma" : "mv ", in_dim, out_dim, n_tok);
+        /* the shared matvec is ds4's Q4_K reference path (single rows) */
         report(what, err, 1e-5);
         free(x);
         free(y);
@@ -771,8 +774,9 @@ static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *t
     free(wr);
 }
 
-/* Weight-streaming time of one projection for n_tok rows: this file's
- * multi-row kernel against the shared Q4_K path (one row per pass). */
+/* Time of one projection for n_tok rows: the shared Q4_K path (classic
+ * matvec, one pass per row up to 8, GEMM above) against the simdgroup-matrix
+ * kernel. */
 static void bench_q4k(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int iters) {
     const uint64_t wbytes = (uint64_t)out_dim * (in_dim / 256u) * Q4K_BYTES;
     uint32_t copies = (uint32_t)((512ull << 20) / wbytes) + 1;
@@ -780,9 +784,9 @@ static void bench_q4k(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int ite
     uint64_t offs[32];
     g_map_used = 0;
     for (uint32_t c = 0; c < copies; c++) offs[c] = map_q4k(in_dim, out_dim);
-    float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
-    ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
-    ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
+    float *x = rand_floats((uint64_t)(n_tok + 1) * in_dim, -1.0f, 1.0f);
+    ds4_gpu_tensor *tx = upload(x, (uint64_t)(n_tok + 1) * in_dim * sizeof(float));
+    ds4_gpu_tensor *ty = upload(NULL, (uint64_t)(n_tok + 1) * out_dim * sizeof(float));
     double best[2] = { 1e30, 1e30 };
     for (int k = 0; k < 2; k++) {
         for (int rep = 0; rep < 4; rep++) {
@@ -790,17 +794,17 @@ static void bench_q4k(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int ite
             const double t0 = now_s();
             for (int i = 0; i < iters; i++) {
                 const uint64_t off = offs[i % copies];
-                require_ok(k == 0 ? ds4_gpu_bonsai2_matmul_q4k_tensor(ty, g_map, g_map_size, off, in_dim,
-                                                                      out_dim, tx, n_tok)
-                                  : ds4_gpu_matmul_quant_tensor(ty, g_map, g_map_size, off, 12u, in_dim,
-                                                                out_dim, tx, n_tok), "bench q4k");
+                require_ok(k == 0 ? ds4_gpu_matmul_quant_tensor(ty, g_map, g_map_size, off, 12u, in_dim,
+                                                                out_dim, tx, n_tok)
+                                  : ds4_gpu_bonsai2_mm_q4k_rows_tensor(ty, g_map, g_map_size, off, in_dim,
+                                                                       out_dim, tx, n_tok), "bench q4k");
             }
             require_ok(ds4_gpu_end_commands(), "end commands");
             const double dt = (now_s() - t0) / iters;
             if (rep > 0 && dt < best[k]) best[k] = dt;
         }
     }
-    printf("  q4k %5u -> %6u  n_tok %u: %7.3f ms %6.1f GB/s   shared path %7.3f ms %6.1f GB/s\n",
+    printf("  q4k %5u -> %6u  n_tok %u: shared %6.3f ms %6.1f GB/s   mma %6.3f ms %6.1f GB/s\n",
            in_dim, out_dim, n_tok, best[0] * 1e3, wbytes / best[0] * 1e-9,
            best[1] * 1e3, wbytes / best[1] * 1e-9);
     free(x);
@@ -842,9 +846,9 @@ static void bench_matmul(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int 
 int main(int argc, char **argv) {
     const int decode_only = argc > 1 && strcmp(argv[1], "--bench-decode") == 0;
     const int q4k_only = argc > 1 && strcmp(argv[1], "--bench-q4k") == 0;
-    const int bench = decode_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
+    const int bench = decode_only || q4k_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
     require_ok(ds4_gpu_init(), "GPU initialization");
-    map_create(bench ? (1100ull << 20) : (1536ull << 20));
+    map_create(bench ? (1100ull << 20) : (2560ull << 20));
     g_rng = 0xb0d5a12ull;
     if (bench) {
         require_ok(ds4_gpu_set_model_map(g_map, g_map_size), "model map registration");
@@ -855,6 +859,8 @@ int main(int argc, char **argv) {
                 bench_q4k(17408, 5120, t, 64);
             }
             bench_q4k(5120, 248320, 1, 8);
+            bench_q4k(5120, 17408, 8, 64);
+            bench_q4k(5120, 17408, 9, 64);
             ds4_gpu_cleanup();
             return 0;
         }
@@ -895,9 +901,11 @@ int main(int argc, char **argv) {
     test_gdn_out_rotate(1);
     test_gdn_out_rotate(5);
     const uint32_t q4k_toks[] = { 1, 2, 3, 4, 5, 8 };
-    test_matmul_q4k(5120, 1024, q4k_toks, 6);
-    test_matmul_q4k(17408, 5120, q4k_toks, 6);
-    test_matmul_q4k(5120, 248320, one, 1);
+    for (int mma = 0; mma < 2; mma++) {
+        test_matmul_q4k(5120, 1024, q4k_toks, 6, mma);
+        test_matmul_q4k(17408, 5120, q4k_toks, 6, mma);
+        test_matmul_q4k(5120, 248320, one, 1, mma);
+    }
     test_gdn_out_silu(1);
     test_gdn_out_silu(3);
     test_gemv_bf16_pair(1);

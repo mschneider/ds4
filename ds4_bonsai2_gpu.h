@@ -88,11 +88,11 @@ int ds4_gpu_bonsai2_gdn_out_rotate_tensor(
         const ds4_gpu_tensor *signs, uint32_t n_tok, uint32_t head_dim,
         uint32_t n_k_head, uint32_t n_rep, float eps);
 
-/* Q4_K matvec for up to eight activation rows, each weight block streamed
- * once per four rows (MTP verify and batched decode).  in_dim must be a
- * multiple of 256 and out_dim of 4; returns 0 without dispatching otherwise
- * or for more than eight rows (prefill uses the shared Q4_K GEMM). */
-int ds4_gpu_bonsai2_matmul_q4k_tensor(
+/* out[t][o] = W[o] . x[t] for a Q4_K weight and 1..8 activation rows on fp32
+ * simdgroup matrices: each weight is dequantized once for all rows, so the
+ * cost is nearly flat in n_tok (MTP verify, batched decode).  in_dim must be
+ * a multiple of 256; returns 0 without dispatching otherwise. */
+int ds4_gpu_bonsai2_mm_q4k_rows_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok);

@@ -12,7 +12,12 @@ llama.cpp's; this tool only changes tensor types:
 
 Weights already in the target type are copied byte for byte; the rest are
 read as BF16/F16/F32 (or Q6_K) and quantized in row chunks with the shared
-native quantizer (make -C gguf-tools quants-shared), so memory stays bounded.
+native quantizer (make -C gguf-tools quants-shared) on a thread pool, so
+memory stays bounded.
+
+--mtp adds the MTP layer from llama.cpp's MTP GGUF (mtp-Qwen3.8-27B-BF16.gguf)
+as block 64, under the same type rules; its copies of token_embd and output
+are dropped, since the layer shares the main model's.
 --keep-quantized copies Q4_K and Q8_0 tensors whatever the targets say (except
 the gates, which always follow --gates), which turns a llama.cpp Q4_K_M into a
 file ds4 runs (its Q6_K tensors become --proj).
@@ -25,9 +30,11 @@ file ds4 runs (its Q6_K tensors become --proj).
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -39,10 +46,10 @@ T_F32, T_F16, T_BF16 = 0, 1, 30
 T_Q8_0, T_Q4_K, T_Q6_K = 8, 12, 14
 QTYPES = {"Q8_0": T_Q8_0, "Q4_K": T_Q4_K, "BF16": T_BF16, "F16": T_F16, "F32": T_F32}
 ALIGN = 32
-CHUNK_ROWS = 8192
+CHUNK_ROWS = 1024
 
 PROJECTIONS = ("attn_qkv", "attn_gate", "ssm_out", "attn_q", "attn_k", "attn_v",
-               "attn_output", "ffn_gate", "ffn_up", "ffn_down")
+               "attn_output", "ffn_gate", "ffn_up", "ffn_down", "nextn.eh_proj")
 
 
 def target_type(name: str, src_type: int, args) -> int:
@@ -126,6 +133,8 @@ def main() -> int:
     ap.add_argument("--gates", default="BF16", choices=QTYPES)
     ap.add_argument("--keep-quantized", action="store_true",
                     help="copy Q4_K/Q8_0 source tensors unchanged")
+    ap.add_argument("--mtp", help="llama.cpp MTP GGUF to merge as block 64")
+    ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--quants-lib", default=str(default_quantizer_library()))
     args = ap.parse_args()
 
@@ -136,13 +145,26 @@ def main() -> int:
 
     plan = []
     for name, (t, dims, off) in src.tensors.items():
-        tt = target_type(name, t, args)
-        plan.append((name, t, tt, dims, off))
-
+        plan.append((name, src, t, target_type(name, t, args), dims, off))
     kv = dict(src.kv)
-    kv["ds4.qwen38_27b.recipe"] = (f"proj={args.proj} embd={args.embd} gates={args.gates}"
-                                   + (" keep-quantized" if args.keep_quantized else ""))
     kv_types = dict(src.kv_types)
+    recipe = f"proj={args.proj} embd={args.embd} gates={args.gates}"
+    if args.keep_quantized:
+        recipe += " keep-quantized"
+    if args.mtp:
+        mtp = Reader(args.mtp)
+        n_layer = src.kv["qwen35.block_count"]
+        if (mtp.kv.get("general.architecture") != "qwen35" or mtp.kv.get("qwen35.nextn_predict_layers") != 1 or
+                mtp.kv.get("qwen35.block_count") != n_layer + 1):
+            raise SystemExit("--mtp is not a one-layer qwen35 MTP GGUF for this model")
+        for name, (t, dims, off) in mtp.tensors.items():
+            if name.startswith(f"blk.{n_layer}."):
+                plan.append((name, mtp, t, target_type(name, t, args), dims, off))
+        kv["qwen35.block_count"] = n_layer + 1
+        kv["qwen35.nextn_predict_layers"] = 1
+        kv_types["qwen35.nextn_predict_layers"] = 4
+        recipe += " mtp"
+    kv["ds4.qwen38_27b.recipe"] = recipe
     kv_types["ds4.qwen38_27b.recipe"] = 8
     kv.pop("general.alignment", None)
 
@@ -151,7 +173,7 @@ def main() -> int:
     for k, v in kv.items():
         header += kv_bytes(k, kv_types[k], v)
     off = 0
-    for name, _, tt, dims, _ in plan:
+    for name, _, _, tt, dims, _ in plan:
         header += w_str(name) + struct.pack("<I", len(dims))
         header += b"".join(struct.pack("<q", d) for d in dims)
         header += struct.pack("<I", tt) + struct.pack("<Q", off)
@@ -161,20 +183,23 @@ def main() -> int:
     out_path = Path(args.out)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
     t0 = time.time()
+    pool = ThreadPoolExecutor(max_workers=args.threads)   # ctypes drops the GIL
     with open(tmp, "wb") as out:
         out.write(header)
-        for i, (name, t, tt, dims, toff) in enumerate(plan):
+        for i, (name, rd, t, tt, dims, toff) in enumerate(plan):
             width = dims[0]
             rows = nbytes(t, dims) // nbytes(t, [width])
             src_row = nbytes(t, [width])
-            src.f.seek(src.data_start + toff)
+            rd.f.seek(rd.data_start + toff)
             written = 0
-            for r0 in range(0, rows, CHUNK_ROWS):
-                n = min(CHUNK_ROWS, rows - r0)
-                raw = src.f.read(n * src_row)
-                blob = raw if tt == t else encode(float_rows(raw, t, width), tt, q)
-                out.write(blob)
-                written += len(blob)
+            for w0 in range(0, rows, CHUNK_ROWS * args.threads):
+                chunks = [rd.f.read(min(CHUNK_ROWS, rows - r0) * src_row)
+                          for r0 in range(w0, min(rows, w0 + CHUNK_ROWS * args.threads), CHUNK_ROWS)]
+                blobs = chunks if tt == t else pool.map(
+                    lambda raw: encode(float_rows(raw, t, width), tt, q), chunks)
+                for blob in blobs:
+                    out.write(blob)
+                    written += len(blob)
             assert written == nbytes(tt, dims), name
             out.write(b"\0" * ((-written) % ALIGN))
             if tt != t or i % 64 == 0:

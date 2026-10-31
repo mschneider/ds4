@@ -14,10 +14,10 @@ on Apple Silicon at no measurable quality cost against a Q4_K_M reference.
 | Step | State |
 |---|---|
 | 1. Load plain `qwen35` GGUFs as a variant beside Bonsai 2; one-token and prefill graph | done: greedy tokens match llama.cpp on all six reference cases |
-| 2. Measure per-token overhead outside weight streaming | first run: 12.1 tok/s on 19.4 GB (≈235 GB/s), controlled bench pending |
-| 3. Q4_K matvec that reads each weight once for 1–4 rows | kernel done and tested; timing pending |
-| 4. MTP head on the existing Qwen3.8 speculative cycle | designed (below), todo |
-| 5. All-4-bit GGUF recipe and KLD/quality check against Q4_K_M and BF16 | recipe tool done; imatrix and KLD todo |
+| 2. Measure per-token overhead outside weight streaming | 15.1 tok/s on the 15.4 GB recipe (M4 Pro): the trunk streams at ≈210 GB/s, overhead is small |
+| 3. Q4_K product that reads each weight once for 1–4 rows | done but not yet a win at two rows (below); the open problem |
+| 4. MTP head on the existing Qwen3.8 speculative cycle | done: greedy output identical with `--mtp`, 78% accepted, 14.4 tok/s (slower than plain until step 3) |
+| 5. All-4-bit GGUF recipe and KLD/quality check against Q4_K_M and BF16 | recipe built (`Qwen3.8-27B-Q4K-MTP.gguf`, 15.42 GB); imatrix and KLD todo |
 
 Each step records what it measured here when it lands.
 
@@ -28,10 +28,15 @@ make
 python3 -m venv misc/qwen38-27b/venv && misc/qwen38-27b/venv/bin/pip install numpy huggingface_hub
 make -C gguf-tools quants-shared
 hf download ggml-org/Qwen3.8-27B-GGUF Qwen3.8-27B-BF16.gguf --local-dir gguf/qwen38-27b
+hf download ggml-org/Qwen3.8-27B-GGUF mtp-Qwen3.8-27B-BF16.gguf --local-dir gguf/qwen38-27b
 misc/qwen38-27b/venv/bin/python gguf-tools/qwen38_27b_quantize.py \
-    --src gguf/qwen38-27b/Qwen3.8-27B-BF16.gguf --out gguf/qwen38-27b/Qwen3.8-27B-Q4K.gguf
-./ds4 -m gguf/qwen38-27b/Qwen3.8-27B-Q4K.gguf -c 32768
+    --src gguf/qwen38-27b/Qwen3.8-27B-BF16.gguf --mtp gguf/qwen38-27b/mtp-Qwen3.8-27B-BF16.gguf \
+    --out gguf/qwen38-27b/Qwen3.8-27B-Q4K-MTP.gguf
+./ds4 -m gguf/qwen38-27b/Qwen3.8-27B-Q4K-MTP.gguf -c 32768 [--mtp]
 ```
+
+The quantizer runs on all cores (about 3 minutes for the 27B; output is
+byte-identical to a single-threaded run).
 
 The server lists the model as `qwen3.8-27b`. Any `qwen35` GGUF whose
 projections are Q4_K, Q8_0, BF16, F16 or F32 loads; ggml-org's Q4_K_M uses
@@ -213,6 +218,41 @@ up to 0.32, against 0.012 for Bonsai, and the difference is llama.cpp's:
 
 The golden file therefore checks tokens exactly and logprobs at 0.4.
 
+## Measurements (M4 Pro, 16-core GPU, AC power, High Power Mode)
+
+Reference code prompt, 200 greedy tokens, `Qwen3.8-27B-Q4K-MTP.gguf`:
+
+| | tok/s | accepted |
+|---|---:|---:|
+| plain decode | 15.1 | |
+| `--mtp`, MTP cache empty over the prompt (Flash Next's behavior) | 13.6 | 66.7% |
+| `--mtp`, MTP layer run over the prompt during prefill | 14.4 | 78.3% |
+
+Output is byte-identical in all three. Filling the MTP layer's KV cache
+during prefill (llama.cpp does the same) costs about 1.5% of prefill speed.
+
+MTP loses because a two-row verify costs 1.84 decode steps, not the ~1.03
+the speed model assumed. One 5120 → 17408 Q4_K projection:
+
+| rows | classic matvec, one pass per row | simdgroup-matrix kernel |
+|---:|---:|---:|
+| 1 | 0.21 ms (238 GB/s) | 0.40 ms |
+| 2 | 0.40 ms | 0.46 ms |
+| 3 | 0.60 ms | 0.47 ms |
+| 4 | 0.79 ms | 0.47 ms |
+| 8 | 1.15 ms (GEMM) | 0.49 ms |
+
+ds4's classic Q4_K matvec (llama.cpp's) reaches the bandwidth limit at one
+row only because its per-weight arithmetic costs about as much as the
+stream: a second row doubles it. Neither a token loop inside it (worse:
+0.47 ms at two rows) nor more weight rows per simdgroup helped. The
+simdgroup-matrix kernel (weights decoded once into register fragments, fp32
+multiply for up to 8 rows) is flat in the row count but 1.9x slower at one
+row, so ds4 uses it from three rows up. MLX's 4-bit qmv shows the headroom
+exists: a full 27B forward at two rows costs it 1.02x one row on this chip.
+A Q4_K kernel near 0.21 ms at two rows would make MTP about 1.45x faster than
+plain decode at this acceptance.
+
 ## Validation plan
 
 - Kernel tests against double-precision CPU references, model-free, in
@@ -265,8 +305,9 @@ the second draft. The family graph needs:
    `token_embd` and `output`.
 
 Flash Next fills the MTP layer's KV cache only from drafting positions;
-llama.cpp also runs the MTP layer over the prompt. Which one gives better
-acceptance on the 27B is measured, not assumed.
+llama.cpp also runs the MTP layer over the prompt. On the 27B the prompt fill
+lifts acceptance from 67% to 78% (Measurements), so the family graph does it;
+Flash Next may benefit the same way.
 
 ## References
 

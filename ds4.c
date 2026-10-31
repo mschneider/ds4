@@ -58871,7 +58871,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
-    if (ds4_model_is_qwen35()) return bonsai2_graph_alloc(g, ctx_cap, cap_tokens, shared, state_pool, hist_pool, slot);
+    if (ds4_model_is_qwen35()) return bonsai2_graph_alloc(g, ctx_cap, cap_tokens, mtp, shared, state_pool, hist_pool, slot);
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -60072,6 +60072,7 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
 static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
+    if (ds4_model_is_qwen35()) return bonsai2_graph_mtp_steps(g, m, w, row, next_tokens, T, idx, want_logits, logits_out, draft_out);
     if (!g->mtp_R || T == 0u || T > 3u || idx > g->ctx_cap || T > g->ctx_cap - idx ||
         row > g->cap_tokens || T > g->cap_tokens - row) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
@@ -60165,6 +60166,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
  * state: the verify gates everything the target commits. */
 static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        int next_token, uint32_t idx, int *draft_out) {
+    if (ds4_model_is_qwen35()) return bonsai2_graph_mtp_chain_step(g, m, w, next_token, idx, draft_out);
     if (!g->mtp_R || g->mtp_last_rows == 0u || g->mtp_last_rows > 3u || !draft_out ||
         idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;

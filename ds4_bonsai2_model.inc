@@ -139,10 +139,13 @@ static void config_validate_bonsai2_model(const ds4_model *m) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(&g_ds4_qwen4_ple, 0, sizeof(g_ds4_qwen4_ple));
 
+    /* The plain model may carry its MTP layer as block 64 (llama.cpp's
+     * layout); the shape then counts it like Flash Next's nextn block. */
     uint32_t nextn = 0;
-    if (model_get_u32(m, "qwen35.nextn_predict_layers", &nextn) && nextn != 0) {
-        ds4_die("qwen35 MTP layers are not supported yet");
-    }
+    (void)model_get_u32(m, "qwen35.nextn_predict_layers", &nextn);
+    if (nextn > (bonsai ? 0u : 1u)) ds4_die("unsupported qwen35.nextn_predict_layers");
+    g_ds4_shape.n_layer += nextn;
+    g_ds4_shape.n_nextn_predict = nextn;
     config_expect_u32("block_count", required_u32(m, "qwen35.block_count"), DS4_N_LAYER);
     config_expect_u32("feed_forward_length", required_u32(m, "qwen35.feed_forward_length"), DS4_N_FF_DENSE);
     config_expect_u32("attention.head_count", required_u32(m, "qwen35.attention.head_count"), DS4_N_HEAD);
@@ -208,6 +211,12 @@ static void weights_bind_bonsai2_layer(ds4_layer_weights *l, const ds4_model *m,
         l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
     }
     l->ffn_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
+    if (ds4_qwen4_layer_is_nextn(il)) {
+        l->nextn_eh_proj          = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm            = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm            = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm = required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
     l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
     l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
     l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
@@ -277,6 +286,12 @@ static void weights_validate_bonsai2_layout(
             bonsai2_expect_f32(l->attn_q_norm, 1, DS4_N_HEAD_DIM, 0);
             bonsai2_expect_f32(l->attn_k_norm, 1, DS4_N_HEAD_DIM, 0);
         }
+        if (ds4_qwen4_layer_is_nextn(il)) {
+            bonsai2_expect_proj(l->nextn_eh_proj, 2u * E, E);
+            bonsai2_expect_f32(l->nextn_enorm, 1, E, 0);
+            bonsai2_expect_f32(l->nextn_hnorm, 1, E, 0);
+            bonsai2_expect_f32(l->nextn_shared_head_norm, 1, E, 0);
+        }
     }
 }
 
@@ -302,7 +317,8 @@ static bool bonsai2_engine_supported(const ds4_engine_options *opt, ds4_backend 
     const char *why = NULL;
     if (backend != DS4_BACKEND_METAL) why = "needs the Metal backend";
     else if (opt->first_token_test || opt->metal_graph_test) why = "has no CPU reference diagnostics";
-    else if (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0])) why = "has no MTP support yet";
+    else if (opt->mtp_path && opt->mtp_path[0]) why = "takes MTP from its own GGUF (--mtp), not --mtp-model";
+    else if (opt->glm_mtp && DS4_N_NEXTN_PREDICT == 0) why = "has no MTP layer in this GGUF";
     if (why) fprintf(stderr, "ds4: %s %s\n", g_ds4_shape.name, why);
     return why == NULL;
 }
@@ -332,11 +348,16 @@ bool ds4_engine_is_qwen38_27b(ds4_engine *e) {
 /* Defined with the graph in ds4_bonsai2.inc; the Qwen3.8 graph entry points
  * hand Bonsai sessions over to them. */
 struct ds4_qwen4_gpu_graph;
-static bool bonsai2_graph_alloc(struct ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens,
+static bool bonsai2_graph_alloc(struct ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp,
                                 const struct ds4_qwen4_gpu_graph *shared,
                                 ds4_gpu_tensor *const *state_pool, ds4_gpu_tensor *const *hist_pool,
                                 uint32_t slot);
 static bool bonsai2_graph_forward_tokens(struct ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                          const ds4_weights *w, const int *tokens, uint32_t T,
                                          float *logits_out, bool all_rows);
+static bool bonsai2_graph_mtp_steps(struct ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                    uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx,
+                                    bool want_logits, float *logits_out, int *draft_out);
+static bool bonsai2_graph_mtp_chain_step(struct ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                         const ds4_weights *w, int next_token, uint32_t idx, int *draft_out);
 #endif

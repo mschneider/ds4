@@ -567,92 +567,106 @@ kernel void kernel_bonsai2_gdn_out_silu(
     *(device float4 *)(o + base) = v;
 }
 
-/* Must match bonsai2_q4k_args in ds4_metal_bonsai2.m. */
-struct bonsai2_q4k_args {
+/* Must match bonsai2_q4k_mm_args in ds4_metal_bonsai2.m. */
+struct bonsai2_q4k_mm_args {
     uint in_dim;
     uint out_dim;
     uint row_bytes;
+    uint n_tok;
 };
 
-/* Q4_K matvec for NT activation rows at once (1..4): out[t][o] = W[o] . x[t].
- * The arithmetic is the classic kernel_mul_mv_q4_K_f32_impl (two simdgroups
- * of two weight rows, eight lanes per block, four blocks in flight), with the
- * token loop moved inside the block loop: each Q4_K block is streamed from
- * memory once and re-read for the other tokens from cache, so verifying 2-4
- * MTP rows costs about one weight pass instead of NT.  out_dim must be a
- * multiple of 4 (rows per threadgroup); in_dim of 256. */
-template <short NT>
-kernel void kernel_bonsai2_mv_q4k(
-        constant bonsai2_q4k_args &a [[buffer(0)]],
-        device const char         *w [[buffer(1)]],
+/* Q4_K product for 1..8 activation rows on fp32 simdgroup matrices, with no
+ * threadgroup staging.  The classic matvec spends about as long on its
+ * per-weight arithmetic as on streaming the weights, so a second row doubles
+ * its time; here every lane decodes its two elements of each 8 x 8 weight
+ * fragment straight into registers once, and one multiply covers all eight
+ * token columns, so 1 to 8 rows cost about the same.
+ *
+ * Fragment layout (the one MLX's steel GEMM relies on): lane L holds
+ * elements (fm, fn) and (fm, fn + 1) with qid = L / 4,
+ * fm = (qid & 4) + (L / 2) % 4, fn = (qid & 2) * 2 + (L % 2) * 2.
+ * A = weights [8 rows][8 k], B = x^T [8 k][8 tokens] (tokens past n_tok read
+ * as 0), C = [8 rows][8 tokens].  The dot product does not care which k a
+ * fragment column stands for, so within a Q4_K group (32 values, value j in
+ * byte j of the group's 32-byte run) step st, column c is k = 4c + st: a
+ * lane's weights for the whole group are bytes 4fn..4fn+7, one aligned
+ * 8-byte load, and its activations x[4fm..4fm+3], one float4 per token.
+ * Each simdgroup owns RT tiles of 8 rows and reuses each B fragment for all
+ * of them; one tile is fastest on M4 Pro (more cost occupancy).
+ *
+ * On M4 Pro this costs 0.40-0.49 ms for 5120 -> 17408 at 1-8 rows against
+ * 0.21 / 0.40 / 0.60 / 0.79 ms for the classic matvec at 1-4 rows (one pass
+ * per row): ds4 uses it from three rows up. */
+template <short RT>
+kernel void kernel_bonsai2_mm_q4k_rows(
+        constant bonsai2_q4k_mm_args &a [[buffer(0)]],
+        device const uchar        *w [[buffer(1)]],
         device const float        *x [[buffer(2)]],
         device float              *y [[buffer(3)]],
         uint   tg   [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg   [[simdgroup_index_in_threadgroup]]) {
-    constexpr short NR0 = 2;
-    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
-    const short ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
-    const int nb = a.in_dim / 256;
-    const uint first_row = (tg * 2 + sg) * NR0;
-    device const block_q4_K *blk = (device const block_q4_K *)(w + (ulong)first_row * a.row_bytes);
-
-    float yl[16], yh[16];
-    float sumf[NT][NR0];
-    for (short t = 0; t < NT; t++) for (short r = 0; r < NR0; r++) sumf[t][r] = 0.f;
-    uint16_t sc16[4];
-    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
-
-    for (int ib = ix; ib < nb; ib += 4) {
-        FOR_UNROLL (short t = 0; t < NT; t++) {
-            device const float *y4 = x + (ulong)t * a.in_dim + ib * 256 + 64 * iq + 8 * ir;
-            float4 sumy = 0.f;
-            for (short i = 0; i < 8; ++i) {
-                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
-                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
-                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
-                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + (lane / 2) % 4;
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    const uint row0 = (tg * 4u + sg) * (8u * RT);
+    if (row0 >= a.out_dim) return;
+    device const uchar *wr[RT];
+    for (short r = 0; r < RT; r++) wr[r] = w + (ulong)min(row0 + 8u * r + fm, a.out_dim - 1u) * a.row_bytes;
+    const bool v0 = (uint)fn < a.n_tok, v1 = (uint)fn + 1u < a.n_tok;
+    device const float4 *x0 = (device const float4 *)(x + (ulong)min((uint)fn, a.n_tok - 1u) * a.in_dim + 4 * fm);
+    device const float4 *x1 = (device const float4 *)(x + (ulong)min((uint)fn + 1u, a.n_tok - 1u) * a.in_dim + 4 * fm);
+    simdgroup_float8x8 C[RT];
+    for (short r = 0; r < RT; r++) C[r] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nb = a.in_dim / 256u;
+    for (uint b = 0; b < nb; b++) {
+        /* the block's eight (scale, min) pairs, ggml's get_scale_min_k4 */
+        float ds[RT][8], dm[RT][8];
+        for (short r = 0; r < RT; r++) {
+            device const uchar *blk = wr[r] + b * 144u;
+            const float2 dd = float2(*(device const half2 *)blk);
+            const uint3 q = *(device const packed_uint3 *)(blk + 4);
+            for (short g = 0; g < 8; g++) {
+                const uint lo = (g < 4 ? q.x : q.z) >> (8 * (g & 3));
+                const uint hi = (g < 4 ? q.y : q.x) >> (8 * (g & 3));
+                uint sv, mv;
+                if (g < 4) { sv = lo & 63u; mv = (q.y >> (8 * g)) & 63u; }
+                else { sv = (lo & 0xFu) | ((hi & 0xC0u) >> 2);
+                       mv = ((lo >> 4) & 0xFu) | (((q.y >> (8 * (g - 4))) & 0xC0u) >> 2); }
+                ds[r][g] = dd.x * (float)sv;
+                dm[r][g] = dd.y * (float)mv;
             }
-            device const uint16_t *sc = (device const uint16_t *)blk[ib].scales + iq;
-            device const uint16_t *q1 = (device const uint16_t *)blk[ib].qs + 16 * iq + 4 * ir;
-            device const half *dh = &blk[ib].d;
-            FOR_UNROLL (short r = 0; r < NR0; r++) {
-                sc16[0] = sc[0] & kmask1;
-                sc16[1] = sc[2] & kmask1;
-                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-                device const uint16_t *q2 = q1 + 32;
-                float4 acc1 = 0.f, acc2 = 0.f;
-                FOR_UNROLL (short i = 0; i < 4; ++i) {
-                    acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                    acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                    acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                    acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                    acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                    acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                    acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                    acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+        }
+        for (short g = 0; g < 8; g++) {
+            const uint k0 = b * 64u + g * 8u;   /* float4 units */
+            const float4 xa = v0 ? x0[k0] : 0.0f;
+            const float4 xb = v1 ? x1[k0] : 0.0f;
+            uint2 qw[RT];
+            for (short r = 0; r < RT; r++) {
+                qw[r] = *(device const uint2 *)(wr[r] + b * 144u + 16u + (g >> 1) * 32u + 4u * fn) >> ((g & 1) * 4u);
+            }
+            for (short st = 0; st < 4; st++) {
+                simdgroup_float8x8 B;
+                B.thread_elements()[0] = xa[st];
+                B.thread_elements()[1] = xb[st];
+                for (short r = 0; r < RT; r++) {
+                    simdgroup_float8x8 A;
+                    A.thread_elements()[0] = ds[r][g] * (float)((qw[r].x >> (8 * st)) & 15u) - dm[r][g];
+                    A.thread_elements()[1] = ds[r][g] * (float)((qw[r].y >> (8 * st)) & 15u) - dm[r][g];
+                    simdgroup_multiply_accumulate(C[r], A, B, C[r]);
                 }
-                sumf[t][r] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-                                       (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-                                       (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-                                       (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-                              dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-                q1 += a.row_bytes / 2;
-                sc += a.row_bytes / 2;
-                dh += a.row_bytes / 2;
             }
         }
     }
-    for (short t = 0; t < NT; t++) {
-        for (short r = 0; r < NR0; r++) {
-            const float s = simd_sum(sumf[t][r]);
-            if (lane == 0) y[(ulong)t * a.out_dim + first_row + r] = s;
-        }
+    for (short r = 0; r < RT; r++) {
+        const uint row = row0 + 8u * r + fm;
+        if (row >= a.out_dim) continue;
+        if (v0) y[(ulong)fn * a.out_dim + row] = C[r].thread_elements()[0];
+        if (v1) y[(ulong)(fn + 1) * a.out_dim + row] = C[r].thread_elements()[1];
     }
 }
 
-template [[host_name("kernel_bonsai2_mv_q4k_1")]] kernel decltype(kernel_bonsai2_mv_q4k<1>) kernel_bonsai2_mv_q4k<1>;
-template [[host_name("kernel_bonsai2_mv_q4k_2")]] kernel decltype(kernel_bonsai2_mv_q4k<2>) kernel_bonsai2_mv_q4k<2>;
-template [[host_name("kernel_bonsai2_mv_q4k_3")]] kernel decltype(kernel_bonsai2_mv_q4k<3>) kernel_bonsai2_mv_q4k<3>;
-template [[host_name("kernel_bonsai2_mv_q4k_4")]] kernel decltype(kernel_bonsai2_mv_q4k<4>) kernel_bonsai2_mv_q4k<4>;
+#define BONSAI2_Q4K_MM(rt) \
+    template [[host_name("kernel_bonsai2_mm_q4k_rows_r" #rt)]] \
+    kernel decltype(kernel_bonsai2_mm_q4k_rows<rt>) kernel_bonsai2_mm_q4k_rows<rt>;
+BONSAI2_Q4K_MM(1)
