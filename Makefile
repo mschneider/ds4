@@ -73,7 +73,7 @@ endif
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
-.PHONY: test-metal-moe-prefill test-metal-dense-mpp
+.PHONY: test-metal-moe-prefill test-metal-dense-mpp test-v41-indexer-score
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -121,6 +121,15 @@ tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 
 tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_v41_indexer_score.o: tests/test_v41_indexer_score.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_v41_indexer_score: tests/test_v41_indexer_score.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-v41-indexer-score: tests/test_v41_indexer_score
+	./tests/test_v41_indexer_score
 
 tests/test_metal_tp_spec.o: tests/test_metal_tp_spec.c ds4.h ds4_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -323,6 +332,7 @@ tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(C
 
 .PHONY: test-metal-command-memory
 test-metal-command-memory: tests/test_metal_command_memory
+	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory buffers
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory row
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory session

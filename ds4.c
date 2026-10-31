@@ -42358,13 +42358,17 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         minimum = 1024u;
 #endif
     if (remaining < minimum) return 1;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#if !defined(DS4_ROCM_BUILD)
     /* Keep a medium SSD append in one layer sweep without changing its
      * 2048-row arithmetic partitions. Tiny tails retain the exact row path. */
     if (g->streaming && g->tp_world == 1 && g->prefill_cap >= 2048u &&
         g->carry_cap >= remaining &&
         remaining > 2048u && remaining < 8192u && remaining % 2048u >= 256u &&
+#ifdef __APPLE__
+        !getenv("DS4_METAL_DISABLE_V41_MEDIUM_SWEEP") &&
+#else
         !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
+#endif
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
 #endif
     if (g->carry_cap && remaining >= 4096u &&
@@ -59900,6 +59904,14 @@ static void *qwen4_ple_prefetch_run(void *context) {
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T, const float *prefetched_ple) {
+    /* The prefetch path stages inputs before forward_tokens_impl, so validate
+     * the whole chunk before reading any embedding or changing PLE history. */
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Qwen3.8 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
     const ds4_vision_span *spans = g->vis_spans;

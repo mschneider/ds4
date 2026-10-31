@@ -64,7 +64,23 @@ static void report(void *ud, const char *event, int current, int total) {
 
 static bool cancelled(void *ud) { return ((progress *)ud)->cancel; }
 
+static void test_invalid_tokens(void) {
+    ds4_qwen4_gpu_graph graph = {0};
+    const int invalid[] = {-1, (int)DS4_N_VOCAB};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        const int tokens[] = {0, invalid[i]};
+        /* No weights or buffers: rejection must precede even the first valid
+         * token's embedding read, with or without prefetched PLE rows. */
+        const float prefetched = 0;
+        assert(!qwen4_graph_stage_inputs(&graph, NULL, NULL, tokens, 2, NULL));
+        assert(!qwen4_graph_stage_inputs(&graph, NULL, NULL, tokens, 2, &prefetched));
+    }
+    puts("Qwen invalid tokens rejected before input staging: OK");
+}
+
 int main(int argc, char **argv) {
+    test_invalid_tokens();
+    if (argc == 2 && !strcmp(argv[1], "--invalid-tokens")) return 0;
     if (argc != 2) {
         fprintf(stderr, "usage: %s QWEN_GGUF\n", argv[0]);
         return 2;
@@ -126,6 +142,23 @@ int main(int argc, char **argv) {
         printf("Qwen PLE %s: exact chunk and decode logits OK\n", names[mode]);
         fflush(stdout);
     }
+    const int invalid_at[] = {0, CHUNK, PROMPT - 1};
+    for (size_t i = 0; i < sizeof(invalid_at) / sizeof(*invalid_at); i++) {
+        ds4_session *session = NULL;
+        assert(ds4_session_create(&session, engine, PROMPT + 8) == 0);
+        const int at = invalid_at[i], original = tokens.v[at];
+        tokens.v[at] = i == 1 ? (int)DS4_N_VOCAB : -1;
+        char error[256] = {0};
+        assert(ds4_session_sync(session, &tokens, error, sizeof(error)) == 1);
+        assert(!session->checkpoint_valid);
+        tokens.v[at] = original;
+        assert(ds4_session_sync(session, &tokens, error, sizeof(error)) == 0);
+        assert(ds4_session_eval(session, next, error, sizeof(error)) == 0);
+        assert(!memcmp(expected + (size_t)FRONTIERS * DS4_N_VOCAB,
+                       session->logits, bytes));
+        ds4_session_free(session);
+    }
+    puts("Qwen PLE invalid-token rejection and recovery: exact logits OK");
     free(expected);
     ds4_tokens_free(&tokens);
     ds4_engine_close(engine);
