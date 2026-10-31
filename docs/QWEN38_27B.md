@@ -253,6 +253,35 @@ exists: a full 27B forward at two rows costs it 1.02x one row on this chip.
 A Q4_K kernel near 0.21 ms at two rows would make MTP about 1.45x faster than
 plain decode at this acceptance.
 
+### Why a second row is not free here (kernel study)
+
+Measured on this machine, one 5120 → 17408 projection:
+
+| kernel | 1 row | 2 rows | 4 rows |
+|---|---:|---:|---:|
+| ds4 classic Q4_K matvec (one pass per row) | 0.215 | 0.396 | 0.793 |
+| same, grid ordered token-first (second pass hits cache) | 0.218 | 0.397 | 0.799 |
+| simdgroup-matrix, fp32 fragments from registers | 0.395 | 0.460 | 0.473 |
+| same with half operands | 0.425 | 0.421 | 0.430 |
+| MLX-style wide matvec (lane per row, 8-value decode reused across rows), fp32 x, 16 lanes/row | 0.275 | 0.369 | 0.755 |
+| same, 2 lanes/row | 0.283 | 0.336 | 0.600 |
+| same, **half x** (timing only) | 0.262 | 0.293 | 0.366 |
+| MLX 0.32.4 `quantized_matmul`, affine 4-bit g64, fp32 x | 0.304 | 0.461 | 0.898 |
+| MLX 0.32.4, **bf16 x** (`qmv_wide`) | 0.207 | 0.214 | 0.348 |
+
+- Cache reuse is not the limit: ordering the grid so the second row's pass
+  re-reads weights from cache changes nothing.
+- The fp32 simdgroup multiply is: removing it (keeping loads and decode) cuts
+  the matrix kernel from 0.39 to 0.27 ms.
+- The activation width is the lever. MLX's two-row cost of 1.03x comes from
+  bf16 activations; with fp32 activations MLX pays 1.5x, and every fp32
+  design tried here pays 1.6x or more. Half activations give 1.12x in the
+  wide kernel.
+
+So on M4 Pro, cheap verification needs 16-bit activations in the verify
+projections, the precision trade MLX makes everywhere and llama.cpp makes
+in its few-row kernels (it is the 3e-3 error found in Verification).
+
 ## Validation plan
 
 - Kernel tests against double-precision CPU references, model-free, in
