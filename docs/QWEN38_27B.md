@@ -278,6 +278,42 @@ Q4_K_M is FFN at Q4_K and the rest higher: its budget is spent on the FFN.
 The GDN and attention projections are the sensitive classes for their size,
 and errors in them compound over long contexts.
 
+### Calibrated recipes
+
+The imatrix comes from `llama-imatrix` (PrismML's llama.cpp build) on the
+Q8_0 recipe, 120 chunks of 512 tokens (61K tokens) of the repo's
+calibration prompts (`gguf-tools/imatrix/dataset/prompts.jsonl`) rendered in
+Qwen's no-think ChatML. It holds no entry for `output.weight`. The KLD code
+text was switched to `rax.c` (absent from the calibration data, unlike
+`ds4_server.c`); this reference (v2) puts the bar at KLD 0.0318, top-1
+94.3%.
+
+| candidate, imatrix | size | KLD | median | top-1 |
+|---|---:|---:|---:|---:|
+| ggml-org Q4_K_M (bar) | 19.40 GB | 0.0318 | 0.0075 | 94.30% |
+| all-Q4_K, no imatrix | 15.42 GB | 0.0660 | 0.0178 | 91.34% |
+| C1 all Q4_K | 15.18 GB | 0.0448 | 0.0122 | 92.58% |
+| C2 attention Q8_0 | 16.02 GB | 0.0394 | 0.0111 | 92.84% |
+| C3 attention + GDN Q8_0 | 18.79 GB | 0.0349 | 0.0092 | 93.26% |
+| C5 attention + head Q8_0 | 16.66 GB | 0.0360 | 0.0080 | 93.95% |
+| **C4 attention + GDN + head Q8_0** | 19.43 GB | **0.0315** | 0.0060 | **94.60%** |
+
+The imatrix cuts the all-Q4_K KLD by a third but not to the bar. The output
+head at Q4_K is what separated C3 from the bar (Q4_K_M keeps it at Q6_K);
+the GDN projections at Q4_K cost about 0.0045 even calibrated (C5 vs C4).
+
+C4 on the official fixtures (against Q4_K_M):
+
+| | NLL vs Q8_0 | vs Q4_K_M | case wins (C4 / Q4_K_M) | first token | API top-1 | API pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| short | +1.96% | +0.16% | 47 / 53 | 89/100 (= Q4_K_M) | 0.967 (0.968) | 0.955 (0.950) |
+| long | -1.01% | -2.36% | 9 / 3 | 12/12 | 0.996 (1.000) | 0.949 (0.945) |
+
+C4 is at 4-bit reference quality: the first valid baseline. It is also
+Q4_K_M's size, so it is not yet faster; Q6_K (`gguf-tools/quants_q6k.inc`,
+`kernel_bonsai2_mv_q6k`) is the step between Q4_K and Q8_0 for the classes
+that need more than 4 bits.
+
 ## Measurements (M4 Pro, 16-core GPU, AC power, High Power Mode)
 
 Reference code prompt, 200 greedy tokens, `Qwen3.8-27B-Q4K-MTP.gguf`:
