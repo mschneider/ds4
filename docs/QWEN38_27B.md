@@ -314,6 +314,39 @@ Q4_K_M's size, so it is not yet faster; Q6_K (`gguf-tools/quants_q6k.inc`,
 `kernel_bonsai2_mv_q6k`) is the step between Q4_K and Q8_0 for the classes
 that need more than 4 bits.
 
+With Q6_K for the sensitive classes (imatrix, FFN and embedding Q4_K):
+
+| candidate | size | KLD | median | top-1 |
+|---|---:|---:|---:|---:|
+| C7 GDN + head Q6_K, attention Q8_0 | 17.78 GB | 0.0312 | 0.0064 | 94.17% |
+| C6 GDN + attention + head Q6_K | 17.37 GB | 0.0323 | 0.0065 | 94.08% |
+
+Official fixtures, against Q4_K_M:
+
+| | NLL vs Q8_0 | vs Q4_K_M | case wins (cand. / Q4_K_M) | first token | API top-1 | API pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| C7 short | +2.22% | +0.41% | 46 / 54 | 90 (89) | 0.967 (0.968) | 0.955 (0.950) |
+| C7 long | -0.78% | -2.13% | 9 / 3 | 12/12 | 0.994 (1.000) | 0.948 (0.945) |
+| C6 short | +2.32% | +0.51% | 44 / 56 | 90 (89) | 0.966 (0.968) | 0.955 (0.950) |
+| C6 long | -0.19% | -1.55% | 9 / 3 | 12/12 | 0.996 (1.000) | 0.948 (0.945) |
+
+Both pass by the repo's release criteria (no first-token drop, no clear NLL
+regression, no material API top-1 or pair-order regression): the short-set
+NLL differences are within the paired noise and the long set favors both
+candidates. C6 is the smallest file at 4-bit reference quality, 2.0 GB
+(10%) smaller than Q4_K_M; C7 is 1.6 GB (8%) smaller. The recipe search
+stops here: the remaining speed is in MTP, prefill and per-token overhead,
+which apply to any of these files.
+
+Rebuild C6 (the imatrix from `llama-imatrix` as above):
+
+```sh
+misc/qwen38-27b/venv/bin/python gguf-tools/qwen38_27b_quantize.py \
+    --src gguf/qwen38-27b/Qwen3.8-27B-BF16.gguf --imatrix misc/qwen38-27b/imatrix-q8.gguf \
+    --set gdn=Q6_K --set attn=Q6_K --set head=Q6_K \
+    [--mtp gguf/qwen38-27b/mtp-Qwen3.8-27B-BF16.gguf] --out Qwen3.8-27B-C6.gguf
+```
+
 ## Measurements (M4 Pro, 16-core GPU, AC power, High Power Mode)
 
 Reference code prompt, 200 greedy tokens, `Qwen3.8-27B-Q4K-MTP.gguf`:
