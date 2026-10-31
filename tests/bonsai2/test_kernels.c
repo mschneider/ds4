@@ -5,7 +5,8 @@
  *
  *   make test-bonsai2-kernels                 correctness
  *   make bench-bonsai2-kernels                decode/prefill throughput
- *   tests/bonsai2/test_kernels --bench-decode  matvec only */
+ *   tests/bonsai2/test_kernels --bench-decode  matvec only
+ *   tests/bonsai2/test_kernels --bench-attn    prefill attention only */
 
 #include <math.h>
 #include <stdbool.h>
@@ -639,6 +640,82 @@ static void test_attn_prep(uint32_t n_tok) {
     ds4_gpu_tensor_free(tkc); ds4_gpu_tensor_free(tvc);
 }
 
+/* Causal gated attention: CPU double reference over the f16 caches (queries
+ * rounded to half after scaling, as on the GPU) and the Qwen3.8 kernel the
+ * flash kernel replaces for prefill. */
+static void attn_inputs(uint32_t n_tok, uint32_t pos0, uint32_t H, uint32_t Hkv, uint32_t D,
+                        float **q, float **gate, _Float16 **kc, _Float16 **vc) {
+    const uint64_t cap = pos0 + n_tok, cache_n = cap * Hkv * D;
+    *q = rand_floats((uint64_t)n_tok * H * D, -2.0f, 2.0f);
+    *gate = rand_floats((uint64_t)n_tok * H * D, -3.0f, 3.0f);
+    *kc = malloc(cache_n * sizeof(_Float16));
+    *vc = malloc(cache_n * sizeof(_Float16));
+    for (uint64_t i = 0; i < cache_n; i++) {
+        (*kc)[i] = (_Float16)rng_uniform(-1.0f, 1.0f);
+        (*vc)[i] = (_Float16)rng_uniform(-1.0f, 1.0f);
+    }
+}
+
+static void test_attn_fa(uint32_t n_tok, uint32_t pos0, uint32_t row_tiles) {
+    const uint32_t H = 24, Hkv = 4, D = 256, group = H / Hkv, cap = pos0 + n_tok;
+    const float scale = 1.0f / 16.0f;
+    float *q, *gate;
+    _Float16 *kc, *vc;
+    attn_inputs(n_tok, pos0, H, Hkv, D, &q, &gate, &kc, &vc);
+    const uint64_t qn = (uint64_t)n_tok * H * D, cache_bytes = (uint64_t)cap * Hkv * D * 2;
+    ds4_gpu_tensor *tq = upload(q, qn * sizeof(float)), *tg = upload(gate, qn * sizeof(float));
+    ds4_gpu_tensor *tk = upload(kc, cache_bytes), *tv = upload(vc, cache_bytes);
+    ds4_gpu_tensor *to = upload(NULL, qn * sizeof(float)), *tr = upload(NULL, qn * sizeof(float));
+    require_ok(ds4_gpu_bonsai2_attn_fa_tensor(to, tq, tg, tk, tv, n_tok, H, Hkv, D, pos0, cap, scale,
+                                              row_tiles), "bonsai2 flash attention");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(tr, tq, tg, tk, tv, NULL, NULL, NULL, n_tok, H, Hkv, D,
+                                                pos0, false, 0u, scale), "qwen4 attention");
+    float *got = download(to, qn), *old = download(tr, qn);
+
+    double *sc = malloc((uint64_t)cap * sizeof(double)), ref[256], e_ref = 0.0, e_old = 0.0;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const uint32_t n = pos0 + t + 1;
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / group;
+            const float *qr = q + ((uint64_t)t * H + h) * D;
+            double mx = -1e300, sum = 0.0;
+            for (uint32_t p = 0; p < n; p++) {
+                const _Float16 *kr = kc + ((uint64_t)p * Hkv + kvh) * D;
+                double d = 0.0;
+                for (uint32_t i = 0; i < D; i++) d += (double)(_Float16)(qr[i] * scale) * (double)kr[i];
+                sc[p] = d;
+                if (d > mx) mx = d;
+            }
+            for (uint32_t p = 0; p < n; p++) { sc[p] = exp(sc[p] - mx); sum += sc[p]; }
+            for (uint32_t i = 0; i < D; i++) ref[i] = 0.0;
+            for (uint32_t p = 0; p < n; p++) {
+                const _Float16 *vr = vc + ((uint64_t)p * Hkv + kvh) * D;
+                for (uint32_t i = 0; i < D; i++) ref[i] += sc[p] / sum * (double)vr[i];
+            }
+            const uint64_t o = ((uint64_t)t * H + h) * D;
+            double oldr[256];
+            for (uint32_t i = 0; i < D; i++) {
+                const double g = 1.0 / (1.0 + exp(-(double)gate[o + i]));
+                ref[i] *= g;
+                oldr[i] = old[o + i];
+            }
+            double e = row_err(got + o, ref, D);
+            if (e > e_ref) e_ref = e;
+            e = row_err(got + o, oldr, D);
+            if (e > e_old) e_old = e;
+        }
+    }
+    char what[96];
+    snprintf(what, sizeof(what), "attn_fa r%u n_tok %3u pos0 %2u vs reference", row_tiles, n_tok, pos0);
+    report(what, e_ref, 1e-2);
+    snprintf(what, sizeof(what), "attn_fa r%u n_tok %3u pos0 %2u vs qwen4 kernel", row_tiles, n_tok, pos0);
+    report(what, e_old, 2e-3);
+
+    free(q); free(gate); free(kc); free(vc); free(got); free(old); free(sc);
+    ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(tv); ds4_gpu_tensor_free(to); ds4_gpu_tensor_free(tr);
+}
+
 /* ---- benchmark --------------------------------------------------------- */
 
 static double now_s(void) {
@@ -680,14 +757,55 @@ static void bench_matmul(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int 
     ds4_gpu_tensor_free(ty);
 }
 
+/* Prefill attention of one full-attention layer over n_tok tokens from
+ * position 0: Qwen3.8 kernel (row_tiles 0) or the flash kernel. */
+static void bench_attn(uint32_t n_tok, uint32_t row_tiles, int iters) {
+    const uint32_t H = 24, Hkv = 4, D = 256;
+    float *q, *gate;
+    _Float16 *kc, *vc;
+    attn_inputs(n_tok, 0, H, Hkv, D, &q, &gate, &kc, &vc);
+    const uint64_t qn = (uint64_t)n_tok * H * D, cache_bytes = (uint64_t)n_tok * Hkv * D * 2;
+    ds4_gpu_tensor *tq = upload(q, qn * sizeof(float)), *tg = upload(gate, qn * sizeof(float));
+    ds4_gpu_tensor *tk = upload(kc, cache_bytes), *tv = upload(vc, cache_bytes);
+    ds4_gpu_tensor *to = upload(NULL, qn * sizeof(float));
+    double best = 1e30;
+    for (int it = 0; it <= iters; it++) {
+        const double t0 = now_s();
+        require_ok(ds4_gpu_begin_commands(), "begin");
+        require_ok(row_tiles ? ds4_gpu_bonsai2_attn_fa_tensor(to, tq, tg, tk, tv, n_tok, H, Hkv, D, 0, n_tok,
+                                                              0.0625f, row_tiles)
+                             : ds4_gpu_qwen4_attn_decode_tensor(to, tq, tg, tk, tv, NULL, NULL, NULL, n_tok,
+                                                                H, Hkv, D, 0, false, 0u, 0.0625f),
+                   "attention");
+        require_ok(ds4_gpu_end_commands(), "end");
+        const double dt = now_s() - t0;
+        if (it > 0 && dt < best) best = dt;   /* first run warms up */
+    }
+    const double flops = 4.0 * H * D * ((double)n_tok * (n_tok + 1) / 2.0);
+    printf("  attn %-6s n_tok %5u  %8.3f ms  %6.2f TFLOPS\n", row_tiles ? (row_tiles == 6 ? "fa r6" : "fa r3") : "qwen4",
+           n_tok, best * 1e3, flops / best * 1e-12);
+    free(q); free(gate); free(kc); free(vc);
+    ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(tv); ds4_gpu_tensor_free(to);
+}
+
 int main(int argc, char **argv) {
     const int decode_only = argc > 1 && strcmp(argv[1], "--bench-decode") == 0;
-    const int bench = decode_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
+    const int attn_only = argc > 1 && strcmp(argv[1], "--bench-attn") == 0;
+    const int bench = decode_only || attn_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
     require_ok(ds4_gpu_init(), "GPU initialization");
     map_create(bench ? (1100ull << 20) : (512ull << 20));
     g_rng = 0xb0d5a12ull;
     if (bench) {
         require_ok(ds4_gpu_set_model_map(g_map, g_map_size), "model map registration");
+        if (attn_only) {
+            printf("bonsai2 prefill attention bench (one layer, 24 x 4 heads of 256):\n");
+            static const uint32_t toks[] = { 512, 2048, 4096, 8192 };
+            for (int t = 0; t < 4; t++)
+                for (uint32_t r = 0; r <= 6; r += 3) bench_attn(toks[t], r, toks[t] >= 4096 ? 3 : 6);
+            ds4_gpu_cleanup();
+            return 0;
+        }
         printf("bonsai2 kernel bench (decode matvec, prefill gemm):\n");
         bench_matmul(5120, 17408, 1, 64);
         bench_matmul(17408, 5120, 1, 64);
@@ -749,6 +867,12 @@ int main(int argc, char **argv) {
     test_attn_prep(1);
     test_attn_prep(7);
     test_attn_prep(40);
+    test_attn_fa(9, 0, 6);
+    test_attn_fa(17, 37, 6);
+    test_attn_fa(64, 5, 6);
+    test_attn_fa(333, 37, 6);
+    test_attn_fa(17, 37, 3);
+    test_attn_fa(333, 0, 3);
 
     ds4_gpu_cleanup();
     munmap(g_map, g_map_size);

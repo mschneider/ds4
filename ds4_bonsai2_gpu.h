@@ -114,6 +114,20 @@ int ds4_gpu_bonsai2_attn_prep_tensor(
         uint32_t pos0, uint32_t cache_cap,
         const float *rope_freq, float rope_mscale, float eps);
 
+/* Prefill attention over the f16 caches, flash style: one threadgroup per
+ * (kv head, block of query tokens) shares each staged K/V tile among all
+ * the block's (token, query head) rows.  Causal over positions 0..pos0+t
+ * for token t; out = softmax(q k^T * scale) v * sigmoid(gate), the same
+ * math as ds4_gpu_qwen4_attn_decode_tensor's dense path, with the queries
+ * rounded to half.  row_tiles (3 or 6) sets the rows per threadgroup in
+ * tiles of 8: floor(8 * row_tiles / (n_head / n_head_kv)) tokens.
+ * head_dim must be 256. */
+int ds4_gpu_bonsai2_attn_fa_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t cache_cap, float scale, uint32_t row_tiles);
+
 #ifdef __cplusplus
 }
 #endif

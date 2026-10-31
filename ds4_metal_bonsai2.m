@@ -102,6 +102,12 @@ static int bonsai2_dispatch(const char *kernel, const void *args, NSUInteger arg
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_metal_get_pipeline(kernel);
         if (!pipeline) return 0;
+        if (threads.width * threads.height * threads.depth > pipeline.maxTotalThreadsPerThreadgroup) {
+            fprintf(stderr, "ds4: %s allows %lu threads per threadgroup, %lu requested\n", kernel,
+                    (unsigned long)pipeline.maxTotalThreadsPerThreadgroup,
+                    (unsigned long)(threads.width * threads.height * threads.depth));
+            return 0;
+        }
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
         if (!cb) return 0;
@@ -364,4 +370,42 @@ int ds4_gpu_bonsai2_attn_prep_tensor(
     }
     return bonsai2_dispatch("kernel_bonsai2_attn_prep", &args, sizeof(args), b, 10,
                             MTLSizeMake(n_head + n_head_kv, n_tok, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* Must match bonsai2_fa_args in metal/bonsai2.metal. */
+typedef struct {
+    uint32_t n_tokens, n_head, n_head_kv, pos0, tok_per_tg;
+    float scale;
+} bonsai2_fa_args;
+
+int ds4_gpu_bonsai2_attn_fa_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t cache_cap, float scale, uint32_t row_tiles) {
+    if (n_tok == 0) return 1;
+    const uint32_t group = n_head_kv ? n_head / n_head_kv : 0;
+    if (head_dim != 256 || n_head_kv == 0 || n_head % n_head_kv != 0 ||
+        (row_tiles != 3 && row_tiles != 6) || group == 0 || group > 8u * row_tiles ||
+        (uint64_t)pos0 + n_tok > cache_cap) {
+        fprintf(stderr, "ds4: bonsai2 flash attention shape is unsupported\n");
+        return 0;
+    }
+    if (!ds4_gpu_init()) return 0;
+    const uint32_t tok_per_tg = 8u * row_tiles / group;
+    const bonsai2_fa_args args = { n_tok, n_head, n_head_kv, pos0, tok_per_tg, scale };
+    const uint64_t q_bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    bonsai2_bind b[5];
+    if (!bonsai2_bind_tensor(&b[0], q, q_bytes, "attn q") ||
+        !bonsai2_bind_tensor(&b[1], gate, q_bytes, "attn gate") ||
+        !bonsai2_bind_tensor(&b[2], k_cache, cache_bytes, "k cache") ||
+        !bonsai2_bind_tensor(&b[3], v_cache, cache_bytes, "v cache") ||
+        !bonsai2_bind_tensor(&b[4], out, q_bytes, "attn out")) {
+        return 0;
+    }
+    return bonsai2_dispatch(row_tiles == 6 ? "kernel_bonsai2_attn_fa_r6" : "kernel_bonsai2_attn_fa_r3",
+                            &args, sizeof(args), b, 5,
+                            MTLSizeMake(n_head_kv, (n_tok + tok_per_tg - 1) / tok_per_tg, 1),
+                            MTLSizeMake(64u * row_tiles, 1, 1), 0);
 }

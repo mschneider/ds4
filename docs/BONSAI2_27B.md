@@ -68,6 +68,7 @@ graph and these kernels are Bonsai's own:
 | `swiglu_rotate`, `rotate`, `unrotate` | FFN down input, attention output input, embedding inverse |
 | `gemv_bf16_pair` | GDN alpha/beta BF16 projections while decoding |
 | `attn_prep` | q/k norm + rope + gate split without the Qwen3.8 Flash Next indexer |
+| `attn_fa_r3` / `attn_fa_r6` | Prefill attention (9+ tokens), flash style: one threadgroup per (KV head, block of 8 query tokens) shares each staged K/V tile among all 48 (token, head) rows; decode keeps the Qwen3.8 kernels |
 
 ## Verification
 
@@ -102,6 +103,27 @@ Shorter prompts lose with the unpack: 316 tokens 99.0 → 97.4 t/s, 186
 tokens 95.8 → 88.7 t/s. Hence the 512-token threshold
 (`ds4_gpu_bonsai2_set_unpack_min_tokens`). Note that Qwen-family prefill
 chunks come from `DS4_QWEN4_PREFILL_CHUNK`; `--prefill-chunk` does not apply.
+
+### Prefill attention
+
+Bonsai's 16 full-attention layers prefill with `attn_fa_r6` instead of the
+Qwen3.8 kernel, which ran one threadgroup per (KV head, token): every token
+re-read the whole K/V history, and its 6 query heads were padded to 16
+matrix rows. The flash kernel stages each K/V tile once for 8 tokens x 6
+heads = 48 rows and keeps the same inner loop, so its output is bit-identical
+(the kernel tests compare against the old kernel exactly). One layer, M4 Pro:
+
+| tokens | Qwen3.8 kernel | `attn_fa_r3` | `attn_fa_r6` |
+|---:|---:|---:|---:|
+| 512 | 4.65 ms | 2.34 ms | 2.64 ms |
+| 2048 | 61.6 ms | 32.1 ms | 33.3 ms |
+| 4096 | 240 ms | 134 ms | 131 ms |
+| 8192 | 950 ms | 541 ms | 513 ms |
+
+Whole-model prefill, default chunk, interleaved runs, same greedy output:
+4069 tokens 100.2 → 104.7 t/s, about 16k tokens 79.4 → 91.9 t/s. Attention
+was about 9% of a 4k prefill (per-op profile); at about 1.6 TFLOPS it is
+still well below the GEMMs, so a deeper rewrite has room left.
 
 ### Against PrismML llama.cpp
 

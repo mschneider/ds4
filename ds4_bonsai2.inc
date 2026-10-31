@@ -256,7 +256,12 @@ static bool bonsai2_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
 }
 
 /* Dense gated GQA over the f16 caches: q/k norms and partial rope in the
- * prep, sigmoid(gate) applied by the Qwen3.8 attention kernels. */
+ * prep, sigmoid(gate) applied by the attention kernel.  Prefill uses
+ * Bonsai's flash kernel, which stages each K/V tile once per block of
+ * query tokens; up to BONSAI2_FA_MIN_TOK tokens the Qwen3.8 decode kernels
+ * (key-split partials for 1-2 tokens) stay. */
+#define BONSAI2_FA_MIN_TOK   8u
+#define BONSAI2_FA_ROW_TILES 6u
 static bool bonsai2_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                     uint32_t il, uint32_t pos0, uint32_t T) {
     const uint32_t H = DS4_N_HEAD, Hkv = DS4_N_HEAD_KV, D = DS4_N_HEAD_DIM;
@@ -268,9 +273,14 @@ static bool bonsai2_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
                                             l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                             T, H, Hkv, D, DS4_N_ROT, pos0, g->ctx_cap,
                                             g_qwen4_rope_freq, g_qwen4_rope_mscale, DS4_RMS_EPS) &&
-           ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
-                                            g->layer_v_cache[il], NULL, NULL, T <= 2u ? g->attn_part : NULL,
-                                            T, H, Hkv, D, pos0, false, 0u, 1.0f / sqrtf((float)D)) &&
+           (T > BONSAI2_FA_MIN_TOK
+                ? ds4_gpu_bonsai2_attn_fa_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
+                                                 g->layer_v_cache[il], T, H, Hkv, D, pos0, g->ctx_cap,
+                                                 1.0f / sqrtf((float)D), BONSAI2_FA_ROW_TILES)
+                : ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
+                                                   g->layer_v_cache[il], NULL, NULL,
+                                                   T <= 2u ? g->attn_part : NULL, T, H, Hkv, D, pos0,
+                                                   false, 0u, 1.0f / sqrtf((float)D))) &&
            ds4_gpu_bonsai2_rotate_tensor(g->q, g->attn_o, g_bonsai2_sign_gpu[BONSAI2_SIGN_INNER], T,
                                          H * D, 0u, 0u, 0u) &&
            bonsai2_mm(g->blk, m, l->attn_output, g->q, T);
