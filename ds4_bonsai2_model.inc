@@ -1,12 +1,14 @@
-/* Ternary Bonsai 2: model contract and weight binding (fork-owned).
+/* Dense qwen35 family: model contract and weight binding (fork-owned).
  * Textually included into ds4.c just before config_validate_model, after the
  * GGUF metadata helpers and the Qwen3.8 validator it borrows from.
  *
- * The GGUF is PrismML's PQ2_0 release used as is (arch "qwen35").  Every
- * metadata key the graph depends on is checked against DS4_SHAPE_BONSAI2,
- * including the Hadamard folding contract: running a folded weight without
- * its activation transform would produce fluent-looking garbage, so a file
- * whose contract differs in any way is refused at load. */
+ * Both variants load llama.cpp "qwen35" GGUFs as is, with one shape.  A file
+ * carrying prism.hadamard.* metadata is Ternary Bonsai 2 (PrismML's PQ2_0
+ * release); anything else is the plain Qwen3.8-27B.  Every metadata key the
+ * graph depends on is checked, including Bonsai's Hadamard folding contract:
+ * running a folded weight without its activation transform would produce
+ * fluent-looking garbage, so a file whose contract differs in any way is
+ * refused at load. */
 
 /* prism.hadamard.sign_values split by input width, in sign_widths order. */
 enum {
@@ -129,15 +131,17 @@ static void bonsai2_validate_hadamard(const ds4_model *m) {
 }
 
 static void config_validate_bonsai2_model(const ds4_model *m) {
+    uint32_t hadamard = 0;
+    const bool bonsai = model_get_u32(m, "prism.hadamard.version", &hadamard);
     config_expect_u32("embedding_length", required_u32(m, "qwen35.embedding_length"),
                       DS4_SHAPE_BONSAI2.n_embd);
-    g_ds4_shape = DS4_SHAPE_BONSAI2;
+    g_ds4_shape = bonsai ? DS4_SHAPE_BONSAI2 : DS4_SHAPE_QWEN38_27B;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(&g_ds4_qwen4_ple, 0, sizeof(g_ds4_qwen4_ple));
 
     uint32_t nextn = 0;
     if (model_get_u32(m, "qwen35.nextn_predict_layers", &nextn) && nextn != 0) {
-        ds4_die("Bonsai MTP layers are not supported");
+        ds4_die("qwen35 MTP layers are not supported yet");
     }
     config_expect_u32("block_count", required_u32(m, "qwen35.block_count"), DS4_N_LAYER);
     config_expect_u32("feed_forward_length", required_u32(m, "qwen35.feed_forward_length"), DS4_N_FF_DENSE);
@@ -170,7 +174,7 @@ static void config_validate_bonsai2_model(const ds4_model *m) {
                       DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM);
     config_expect_u32("full_attention_interval",
                       required_u32(m, "qwen35.full_attention_interval"), DS4_N_FULL_ATTN_INTERVAL);
-    bonsai2_validate_hadamard(m);
+    if (bonsai) bonsai2_validate_hadamard(m);
 }
 
 static void weights_bind_bonsai2_output(ds4_weights *w, const ds4_model *m, bool required, bool optional) {
@@ -209,8 +213,21 @@ static void weights_bind_bonsai2_layer(ds4_layer_weights *l, const ds4_model *m,
     l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
 }
 
-static void bonsai2_expect_pq2(const ds4_tensor *t, uint64_t in_dim, uint64_t out_dim) {
-    tensor_expect_layout(t, DS4_TENSOR_PQ2_0, 2, in_dim, out_dim, 0);
+/* A projection: PQ2_0 for Bonsai; for the plain model any type the graph
+ * multiplies (qwen4_gemv's types plus Q4_K, see bonsai2_mm). */
+static void bonsai2_expect_proj(const ds4_tensor *t, uint64_t in_dim, uint64_t out_dim) {
+    uint32_t type = DS4_TENSOR_PQ2_0;
+    if (!ds4_model_is_bonsai2() && t) {
+        switch (t->type) {
+        case DS4_TENSOR_Q4_K: case DS4_TENSOR_Q8_0: case DS4_TENSOR_Q4_0:
+        case DS4_TENSOR_BF16: case DS4_TENSOR_F16: case DS4_TENSOR_F32:
+            type = t->type;
+            break;
+        default:
+            break;
+        }
+    }
+    tensor_expect_layout(t, type, 2, in_dim, out_dim, 0);
 }
 
 static void bonsai2_expect_f32(const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1) {
@@ -224,34 +241,39 @@ static void weights_validate_bonsai2_layout(
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
-    if (require_token_embd) bonsai2_expect_pq2(w->token_embd, E, V);
+    if (require_token_embd) bonsai2_expect_proj(w->token_embd, E, V);
     if (require_output) {
         bonsai2_expect_f32(w->output_norm, 1, E, 0);
-        bonsai2_expect_pq2(w->output, E, V);
+        bonsai2_expect_proj(w->output, E, V);
     }
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         bonsai2_expect_f32(l->attn_norm, 1, E, 0);
         bonsai2_expect_f32(l->ffn_norm, 1, E, 0);
-        bonsai2_expect_pq2(l->ffn_gate, E, F);
-        bonsai2_expect_pq2(l->ffn_up, E, F);
-        bonsai2_expect_pq2(l->ffn_down, F, E);
+        bonsai2_expect_proj(l->ffn_gate, E, F);
+        bonsai2_expect_proj(l->ffn_up, E, F);
+        bonsai2_expect_proj(l->ffn_down, F, E);
         if (ds4_qwen4_layer_is_linear(il)) {
-            bonsai2_expect_pq2(l->lin_qkv, E, DS4_N_LIN_CONV_DIM);
-            bonsai2_expect_pq2(l->lin_gate, E, v_dim);
-            bonsai2_expect_pq2(l->lin_out, v_dim, E);
-            tensor_expect_layout(l->lin_alpha, DS4_TENSOR_BF16, 2, E, DS4_N_LIN_V_HEAD, 0);
-            tensor_expect_layout(l->lin_beta, DS4_TENSOR_BF16, 2, E, DS4_N_LIN_V_HEAD, 0);
+            bonsai2_expect_proj(l->lin_qkv, E, DS4_N_LIN_CONV_DIM);
+            bonsai2_expect_proj(l->lin_gate, E, v_dim);
+            bonsai2_expect_proj(l->lin_out, v_dim, E);
+            if (ds4_model_is_bonsai2()) {
+                tensor_expect_layout(l->lin_alpha, DS4_TENSOR_BF16, 2, E, DS4_N_LIN_V_HEAD, 0);
+                tensor_expect_layout(l->lin_beta, DS4_TENSOR_BF16, 2, E, DS4_N_LIN_V_HEAD, 0);
+            } else {
+                bonsai2_expect_proj(l->lin_alpha, E, DS4_N_LIN_V_HEAD);
+                bonsai2_expect_proj(l->lin_beta, E, DS4_N_LIN_V_HEAD);
+            }
             bonsai2_expect_f32(l->lin_conv, 2, DS4_N_LIN_CONV, DS4_N_LIN_CONV_DIM);
             bonsai2_expect_f32(l->lin_a, 1, DS4_N_LIN_V_HEAD, 0);
             bonsai2_expect_f32(l->lin_dt_bias, 1, DS4_N_LIN_V_HEAD, 0);
             bonsai2_expect_f32(l->lin_norm, 1, DS4_N_LIN_HEAD_DIM, 0);
         } else {
             /* attn_q rows hold every head's query followed by its output gate */
-            bonsai2_expect_pq2(l->attn_q, E, 2u * q_dim);
-            bonsai2_expect_pq2(l->attn_k, E, kv_dim);
-            bonsai2_expect_pq2(l->attn_v, E, kv_dim);
-            bonsai2_expect_pq2(l->attn_output, q_dim, E);
+            bonsai2_expect_proj(l->attn_q, E, 2u * q_dim);
+            bonsai2_expect_proj(l->attn_k, E, kv_dim);
+            bonsai2_expect_proj(l->attn_v, E, kv_dim);
+            bonsai2_expect_proj(l->attn_output, q_dim, E);
             bonsai2_expect_f32(l->attn_q_norm, 1, DS4_N_HEAD_DIM, 0);
             bonsai2_expect_f32(l->attn_k_norm, 1, DS4_N_HEAD_DIM, 0);
         }
@@ -273,21 +295,37 @@ static void bonsai2_pq2_row(const ds4_model *m, const ds4_tensor *t, uint64_t ro
     }
 }
 
-/* Bonsai runs only on the resident single-device Metal graph for now; the
- * remaining Qwen3.8 restrictions (TP, SSD streaming, ...) are checked after
- * this by the shared Qwen3.8 gate. */
+/* Both variants run only on the resident single-device Metal graph for now;
+ * the remaining Qwen3.8 restrictions (TP, SSD streaming, ...) are checked
+ * after this by the shared Qwen3.8 gate. */
 static bool bonsai2_engine_supported(const ds4_engine_options *opt, ds4_backend backend) {
     const char *why = NULL;
     if (backend != DS4_BACKEND_METAL) why = "needs the Metal backend";
     else if (opt->first_token_test || opt->metal_graph_test) why = "has no CPU reference diagnostics";
-    else if (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0])) why = "has no MTP weights";
-    if (why) fprintf(stderr, "ds4: Ternary Bonsai 2 %s\n", why);
+    else if (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0])) why = "has no MTP support yet";
+    if (why) fprintf(stderr, "ds4: %s %s\n", g_ds4_shape.name, why);
     return why == NULL;
+}
+
+/* KV disk files are tagged with the weight precision so a cache written by
+ * one quantization is never restored into another. */
+static int bonsai2_quant_bits(const ds4_weights *w) {
+    if (ds4_model_is_bonsai2()) return 2;
+    switch (w->layer[0].ffn_gate->type) {
+    case DS4_TENSOR_Q4_K: case DS4_TENSOR_Q4_0: return 4;
+    case DS4_TENSOR_Q8_0: return 8;
+    default: return 16;
+    }
 }
 
 bool ds4_engine_is_bonsai2(ds4_engine *e) {
     (void)e;
     return ds4_model_is_bonsai2();
+}
+
+bool ds4_engine_is_qwen38_27b(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen38_27b();
 }
 
 #ifdef DS4_HAS_QWEN4_GPU

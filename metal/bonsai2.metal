@@ -537,3 +537,122 @@ kernel void kernel_bonsai2_attn_prep(
     qwen4_attn_prep_slot(args, tg.x, tg.y, pos, pos3[pos], qg, kproj, vproj, qg, qg, g_q, g_k, g_q,
                          q_out, gate_out, k_cache, v_cache, q_out, q_out, row, lane);
 }
+
+/* --- plain Qwen3.8-27B ------------------------------------------------- */
+
+/* Must match bonsai2_gdn_out_args in ds4_metal_bonsai2.m. */
+struct bonsai2_gdn_out_args {
+    uint  n_tok;
+    uint  n_head;
+    float eps;
+};
+
+/* Unrotated GDN output norm and gate, in place in the scan's tiled V order
+ * (llama.cpp reorders ssm_out's columns to match, so no permutation):
+ *   o = rms_head(o) * norm * silu(z)
+ * One simdgroup per (head, token); heads are 128 wide, four values a lane.
+ * Same as kernel_qwen4_gdn_out with Qwen3.8-27B's silu gate. */
+kernel void kernel_bonsai2_gdn_out_silu(
+        constant bonsai2_gdn_out_args &a [[buffer(0)]],
+        device float              *o [[buffer(1)]],
+        device const float        *z [[buffer(2)]],
+        device const float        *w [[buffer(3)]],
+        uint2  tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const ulong base = ((ulong)tg.y * a.n_head + tg.x) * 128 + lane * 4;
+    float4 v = *(device const float4 *)(o + base);
+    const float r = rsqrt(simd_sum(dot(v, v)) / 128.0f + a.eps);
+    const float4 zv = *(device const float4 *)(z + base);
+    v *= r * *(device const float4 *)(w + lane * 4) * (zv / (1.0f + exp(-zv)));
+    *(device float4 *)(o + base) = v;
+}
+
+/* Must match bonsai2_q4k_args in ds4_metal_bonsai2.m. */
+struct bonsai2_q4k_args {
+    uint in_dim;
+    uint out_dim;
+    uint row_bytes;
+};
+
+/* Q4_K matvec for NT activation rows at once (1..4): out[t][o] = W[o] . x[t].
+ * The arithmetic is the classic kernel_mul_mv_q4_K_f32_impl (two simdgroups
+ * of two weight rows, eight lanes per block, four blocks in flight), with the
+ * token loop moved inside the block loop: each Q4_K block is streamed from
+ * memory once and re-read for the other tokens from cache, so verifying 2-4
+ * MTP rows costs about one weight pass instead of NT.  out_dim must be a
+ * multiple of 4 (rows per threadgroup); in_dim of 256. */
+template <short NT>
+kernel void kernel_bonsai2_mv_q4k(
+        constant bonsai2_q4k_args &a [[buffer(0)]],
+        device const char         *w [[buffer(1)]],
+        device const float        *x [[buffer(2)]],
+        device float              *y [[buffer(3)]],
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const short ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
+    const int nb = a.in_dim / 256;
+    const uint first_row = (tg * 2 + sg) * NR0;
+    device const block_q4_K *blk = (device const block_q4_K *)(w + (ulong)first_row * a.row_bytes);
+
+    float yl[16], yh[16];
+    float sumf[NT][NR0];
+    for (short t = 0; t < NT; t++) for (short r = 0; r < NR0; r++) sumf[t][r] = 0.f;
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        FOR_UNROLL (short t = 0; t < NT; t++) {
+            device const float *y4 = x + (ulong)t * a.in_dim + ib * 256 + 64 * iq + 8 * ir;
+            float4 sumy = 0.f;
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            device const uint16_t *sc = (device const uint16_t *)blk[ib].scales + iq;
+            device const uint16_t *q1 = (device const uint16_t *)blk[ib].qs + 16 * iq + 4 * ir;
+            device const half *dh = &blk[ib].d;
+            FOR_UNROLL (short r = 0; r < NR0; r++) {
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+                device const uint16_t *q2 = q1 + 32;
+                float4 acc1 = 0.f, acc2 = 0.f;
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                }
+                sumf[t][r] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                       (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                       (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                       (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                              dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+                q1 += a.row_bytes / 2;
+                sc += a.row_bytes / 2;
+                dh += a.row_bytes / 2;
+            }
+        }
+    }
+    for (short t = 0; t < NT; t++) {
+        for (short r = 0; r < NR0; r++) {
+            const float s = simd_sum(sumf[t][r]);
+            if (lane == 0) y[(ulong)t * a.out_dim + first_row + r] = s;
+        }
+    }
+}
+
+template [[host_name("kernel_bonsai2_mv_q4k_1")]] kernel decltype(kernel_bonsai2_mv_q4k<1>) kernel_bonsai2_mv_q4k<1>;
+template [[host_name("kernel_bonsai2_mv_q4k_2")]] kernel decltype(kernel_bonsai2_mv_q4k<2>) kernel_bonsai2_mv_q4k<2>;
+template [[host_name("kernel_bonsai2_mv_q4k_3")]] kernel decltype(kernel_bonsai2_mv_q4k<3>) kernel_bonsai2_mv_q4k<3>;
+template [[host_name("kernel_bonsai2_mv_q4k_4")]] kernel decltype(kernel_bonsai2_mv_q4k<4>) kernel_bonsai2_mv_q4k<4>;

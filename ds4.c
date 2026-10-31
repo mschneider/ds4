@@ -540,6 +540,7 @@ typedef enum {
     /* fork-owned variants start at 200 so upstream additions never take
      * the same KV-cache model id */
     DS4_VARIANT_BONSAI2 = 200,
+    DS4_VARIANT_QWEN38_27B = 201,
 } ds4_variant;
 
 typedef struct {
@@ -5909,7 +5910,7 @@ static void weights_validate_layout(
                                         require_output);
         return;
     }
-    if (ds4_model_is_bonsai2()) {
+    if (ds4_model_is_qwen35()) {
         weights_validate_bonsai2_layout(w, layer_start, layer_end,
                                         require_token_embd, require_output);
         return;
@@ -7670,7 +7671,7 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (ds4_model_is_bonsai2()) {
+    if (ds4_model_is_qwen35()) {
         weights_bind_bonsai2_output(w, m, required, optional);
     } else if (ds4_model_is_qwen4()) {
         if (required) {
@@ -7849,7 +7850,7 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
 }
 
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
-    if (ds4_model_is_bonsai2()) {
+    if (ds4_model_is_qwen35()) {
         weights_bind_bonsai2_layer(l, m, il);
         return;
     }
@@ -58870,7 +58871,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
-    if (ds4_model_is_bonsai2()) return bonsai2_graph_alloc(g, ctx_cap, cap_tokens, shared, state_pool, hist_pool, slot);
+    if (ds4_model_is_qwen35()) return bonsai2_graph_alloc(g, ctx_cap, cap_tokens, shared, state_pool, hist_pool, slot);
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -59744,7 +59745,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                             const int *tokens, uint32_t T, float *logits_out, bool all_rows,
                                             bool inputs_staged, double stage_start) {
-    if (ds4_model_is_bonsai2()) return bonsai2_graph_forward_tokens(g, m, w, tokens, T, logits_out, all_rows);
+    if (ds4_model_is_qwen35()) return bonsai2_graph_forward_tokens(g, m, w, tokens, T, logits_out, all_rows);
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     const uint32_t pos0 = g->pos;
@@ -63240,7 +63241,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
-    if (ds4_model_is_bonsai2()) return 2;   /* dense PQ2_0: tags its KV files */
+    if (ds4_model_is_qwen35()) return bonsai2_quant_bits(&e->weights);   /* tags its KV files */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -71946,7 +71947,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
-    if (ds4_model_is_bonsai2() && !opt->inspect_only && !bonsai2_engine_supported(opt, e->backend)) {
+    if (ds4_model_is_qwen35() && !opt->inspect_only && !bonsai2_engine_supported(opt, e->backend)) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -76852,7 +76853,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                         DS4_N_EMBD * sizeof(float);
         /* One next-chunk buffer at most; skip tiny chunks where thread startup
          * outweighs the disk read and large chunks that add memory pressure. */
-        if (!getenv("DS4_QWEN4_NO_PLE_PREFETCH") && !ds4_model_is_bonsai2() &&
+        if (!getenv("DS4_QWEN4_NO_PLE_PREFETCH") && !ds4_model_is_qwen35() &&
             prompt->len - start > (int)s->qwen4_graph.cap_tokens &&
             s->qwen4_graph.cap_tokens >= 256u && prefetch_bytes <= 128u * 1024u * 1024u) {
             prefetch.rows = malloc((size_t)prefetch_bytes);
@@ -80331,7 +80332,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
 static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int count,
                                                     ds4_qwen4_gpu_graph *g,
                                                     const ds4_model *m, const ds4_weights *w) {
-    if (ds4_model_is_bonsai2()) return bonsai2_graph_encode_session_batch(items, count, g, m, w);
+    if (ds4_model_is_qwen35()) return bonsai2_graph_encode_session_batch(items, count, g, m, w);
     const uint32_t T = (uint32_t)count;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;

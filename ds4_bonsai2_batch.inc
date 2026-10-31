@@ -1,6 +1,6 @@
-/* Ternary Bonsai 2 batched decode (fork-owned), textually included into
- * ds4.c right before qwen4_graph_encode_native_session_batch, which hands
- * Bonsai batches here.  Same contract as that function: one token per
+/* Dense qwen35 batched decode (fork-owned), textually included into ds4.c
+ * right before qwen4_graph_encode_native_session_batch, which hands Bonsai
+ * and plain Qwen3.8-27B batches here.  Same contract as that function: one token per
  * session, rows in item order, the arena's batch_logits receive row i for
  * items[i]; the caller reads them and advances each session's pos.
  *
@@ -59,7 +59,7 @@ static bool bonsai2_graph_encode_session_batch(ds4_decode_item *items, int count
     for (int i = 0; i < count; i++) {
         ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
         if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB || rg->pos >= rg->ctx_cap) return false;
-        bonsai2_pq2_row(m, w->token_embd, (uint64_t)items[i].token, g->host_row + (uint64_t)i * E);
+        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, g->host_row + (uint64_t)i * E);
         uint32_t pos3[4];
         qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
         pos3[3] = 0;
@@ -69,7 +69,7 @@ static bool bonsai2_graph_encode_session_batch(ds4_decode_item *items, int count
 
     bonsai2_batch_row rows[QWEN4_BATCH_MAX_ROWS];
     if (!bonsai2_batch_rows_build(rows, count, g)) return false;
-    bool ok = ds4_gpu_bonsai2_unrotate_tensor(g->R, g_bonsai2_sign_gpu[BONSAI2_SIGN_EMBD], T, E) != 0;
+    bool ok = bonsai2_embed_finish(g, T);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         ok = bonsai2_norm(g, m, l->attn_norm, g->R, g->xn, T);
@@ -89,11 +89,8 @@ static bool bonsai2_graph_encode_session_batch(ds4_decode_item *items, int count
                                                    rows[i].qkv, rows[i].ga, rows[i].gb, 1u, Hk, Hv, Dl,
                                                    NULL, 0u, NULL, 1u) != 0;
             }
-            ok = ok && ds4_gpu_bonsai2_gdn_out_rotate_tensor(g->q, g->lin_o, g->z, m->map, m->size,
-                                                             l->lin_norm->abs_offset,
-                                                             g_bonsai2_sign_gpu[BONSAI2_SIGN_INNER], T, Dl, Hk,
-                                                             Hv / Hk, DS4_RMS_EPS) &&
-                 bonsai2_mm(g->blk, m, l->lin_out, g->q, T);
+            ds4_gpu_tensor *out_in = ok ? bonsai2_gdn_out(g, m, l, T) : NULL;
+            ok = out_in && bonsai2_mm(g->blk, m, l->lin_out, out_in, T);
         } else if (ok) {
             ok = bonsai2_mm(g->qg, m, l->attn_q, g->mixed, T) &&
                  bonsai2_mm(g->kp, m, l->attn_k, g->mixed, T) &&
@@ -111,9 +108,8 @@ static bool bonsai2_graph_encode_session_batch(ds4_decode_item *items, int count
                                                       g->attn_part, 1u, H, Hkv, D, rg->pos, false, 0u,
                                                       1.0f / sqrtf((float)D));
             }
-            ok = ok && ds4_gpu_bonsai2_rotate_tensor(g->q, g->attn_o, g_bonsai2_sign_gpu[BONSAI2_SIGN_INNER], T,
-                                                     H * D, 0u, 0u, 0u) &&
-                 bonsai2_mm(g->blk, m, l->attn_output, g->q, T);
+            ds4_gpu_tensor *out_in = ok ? bonsai2_attn_out(g, T) : NULL;
+            ok = out_in && bonsai2_mm(g->blk, m, l->attn_output, out_in, T);
         }
         ok = ok && ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E) &&
              bonsai2_graph_ffn(g, m, l, T) &&

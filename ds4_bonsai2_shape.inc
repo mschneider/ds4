@@ -1,5 +1,7 @@
-/* Ternary Bonsai 2 27B (fork-owned), textually included into ds4.c right
- * after the Qwen3.8 layer predicates.
+/* Dense qwen35 family (fork-owned): Ternary Bonsai 2 27B and the plain
+ * Qwen3.8-27B it is quantized from.  Textually included into ds4.c right after
+ * the Qwen3.8 layer predicates.  The ds4_bonsai2*.inc files implement both
+ * variants; only the weight encoding differs (see ds4_model_is_bonsai2).
  *
  * PrismML's ternary Qwen3.8-27B: 64 dense layers repeating 3 Gated DeltaNet
  * + 1 gated GQA attention, SwiGLU FFNs, untied embedding and head.  The GDN
@@ -39,6 +41,45 @@ static const ds4_shape DS4_SHAPE_BONSAI2 = {
     .rope_orig_ctx = 262144,
 };
 
+/* Qwen3.8-27B with ordinary GGUF weights (Q4_K, Q8_0, BF16, ...): the same
+ * shape without the rotation, so it is Bonsai's graph minus its transforms. */
+static const ds4_shape DS4_SHAPE_QWEN38_27B = {
+    .name = "Qwen3.8 27B",
+    .family = DS4_MODEL_FAMILY_QWEN4_EXP,
+    .variant = DS4_VARIANT_QWEN38_27B,
+    .n_layer = 64,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_ff_dense = 17408,
+    .n_hc = 1,
+    .n_lin_k_head = 16,
+    .n_lin_v_head = 48,
+    .n_lin_head_dim = 128,
+    .n_lin_conv = 4,
+    .n_full_attn_interval = 4,
+    .n_ple_layer = DS4_MAX_LAYER,
+    .n_ple_conv = 1,
+    .ple_eos_id = 248044,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 262144,
+};
+
+/* Bonsai: every projection is PQ2_0 behind a Hadamard rotation. */
 static bool ds4_model_is_bonsai2(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_BONSAI2;
+}
+
+static bool ds4_model_is_qwen38_27b(void) {
+    return DS4_MODEL_VARIANT == DS4_VARIANT_QWEN38_27B;
+}
+
+/* Either dense qwen35 variant: the fork hooks dispatch on this. */
+static bool ds4_model_is_qwen35(void) {
+    return ds4_model_is_bonsai2() || ds4_model_is_qwen38_27b();
 }
