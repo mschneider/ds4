@@ -254,8 +254,10 @@ kernel void kernel_bonsai2_mm_pq2(
             const half v = (half)((short)((q >> (2 * (i % 8))) & 3) - 1) * d;
             sa_dst[64 * 8 * (i / 8) + 8 * (i % 8)] = v;
         }
-        *(threadgroup half4 *)(sb_dst)     = (half4)x0;
-        *(threadgroup half4 *)(sb_dst + 4) = (half4)x1;
+        /* Clamp to the fp16 range: an outlier activation saturates instead of
+         * turning into inf and NaN-poisoning the residual and KV cache. */
+        *(threadgroup half4 *)(sb_dst)     = (half4)clamp(x0, -65504.0f, 65504.0f);
+        *(threadgroup half4 *)(sb_dst + 4) = (half4)clamp(x1, -65504.0f, 65504.0f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup const half *la = sa + 4 * 64 * (sg % 2);
