@@ -6,7 +6,7 @@
  * forward pass dispatch here (qwen4_graph_alloc / qwen4_graph_forward_tokens),
  * so recurrent state, KV caches, positions, snapshots and disk payloads use
  * the Qwen3.8 fields and code unchanged.  The graph itself is the plain
- * Qwen3.5-style decoder:
+ * dense Qwen3.8-27B decoder:
  *
  *   h = s * H(embd_latent[token])                      latent row, inverse rotation
  *   per layer:  x = rms(h) * attn_norm
@@ -222,8 +222,8 @@ static bool bonsai2_gates(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_
 }
 
 /* Gated DeltaNet: the Qwen3.8 conv/prep/scan kernels on Bonsai's tiled V-head
- * order.  The output norm is Bonsai's own: Qwen3.5 gates with silu(z) where
- * Qwen3.8 uses sigmoid(z), and ssm_out kept HF grouped order, so the fused
+ * order.  The output norm is Bonsai's own: Qwen3.8-27B gates with silu(z) where
+ * Qwen3.8 Flash Next uses sigmoid(z), and ssm_out kept HF grouped order, so the fused
  * kernel also permutes before rotating. */
 static bool bonsai2_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                  uint32_t il, uint32_t T) {

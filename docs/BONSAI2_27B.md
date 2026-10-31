@@ -34,7 +34,7 @@ all behave as they do for Qwen3.8 Flash Next.
 
 ## Model
 
-Ternary Bonsai 2 is a ternary QAT of Qwen3.5-27B (GGUF arch `qwen35`). It has:
+Ternary Bonsai 2 is a ternary QAT of Qwen3.8-27B (GGUF arch `qwen35`). It has:
 
 - 64 layers in the pattern 3 × Gated DeltaNet + 1 × gated GQA, with a 5120
   hidden size and dense SwiGLU FFNs (17408).
@@ -63,10 +63,10 @@ graph and these kernels are Bonsai's own:
 |---|---|
 | `mv_pq2` / `mm_pq2` | PQ2_0 matvec (1–8 tokens) and simdgroup GEMM (prefill) |
 | `rms_rotate` | RMSNorm, then sign and 1024-FWHT (input of every projection) |
-| `gdn_out_rotate` | GDN head norm with a **silu(z)** gate (Qwen3.8 uses sigmoid), tiled→grouped permutation, rotation |
+| `gdn_out_rotate` | GDN head norm with a **silu(z)** gate (Qwen3.8 Flash Next uses sigmoid), tiled→grouped permutation, rotation |
 | `swiglu_rotate`, `rotate`, `unrotate` | FFN down input, attention output input, embedding inverse |
 | `gemv_bf16_pair` | GDN alpha/beta BF16 projections while decoding |
-| `attn_prep` | q/k norm + rope + gate split without the Qwen3.8 indexer |
+| `attn_prep` | q/k norm + rope + gate split without the Qwen3.8 Flash Next indexer |
 
 ## Verification
 
