@@ -218,6 +218,66 @@ up to 0.32, against 0.012 for Bonsai, and the difference is llama.cpp's:
 
 The golden file therefore checks tokens exactly and logprobs at 0.4.
 
+## Quality
+
+The goal is the fastest decode **at 4-bit reference quality**: ggml-org's
+Q4_K_M is the bar, and a change that makes a file score below it is not
+kept, however fast. Every speed number above or below is only valid for a
+file that meets the bar.
+
+### Gates
+
+1. **Official continuations** (the repo's release gate, section 3 of
+   `QA_BEFORE_RELEASES.md`): `score_official` and `compare_scores.py` on
+   two fixtures from the hosted checkpoint, collected with
+   `collect_official.py` and the repo's Qwen settings (empty system message,
+   no thinking, 64 tokens, top-5 logprobs, temperature 0) from one pinned
+   OpenRouter endpoint serving Qwen's official FP8 checkpoint
+   (`qwen/qwen3.8-27b`, Ionstream, no fallbacks):
+   - `gguf-tools/quality-testing/data/qwen38-27b-ionstream-fp8-100`: the
+     repo's 100 prompts, scored at context 4096;
+   - `gguf-tools/quality-testing/data/qwen38-27b-ionstream-fp8-long`: the 12
+     2K-24K-token archive/code prompts of the Flash Next long set
+     (byte-identical prompts), scored at context 32768.
+   Both are untracked until promoted into release QA.
+2. **KLD** against a local Q8_0 reference (`tests/qwen38_27b/kld`), the
+   faster and finer check while iterating: full-vocabulary KL divergence,
+   top-1 agreement and perplexity over 3072 teacher-forced decode positions
+   (Italian prose, an English story, C code; none of them in the imatrix
+   calibration data). The reference is the Q8_0 recipe run by ds4 in fp32,
+   about 0.001 KLD from BF16 by bartowski's numbers; BF16 itself does not
+   fit in 48 GB.
+3. **Exactness**: `make test-qwen38-27b-reference` (greedy tokens against
+   llama.cpp) and `make test-bonsai2-reference` after graph changes.
+
+### Baseline
+
+Official continuations, against the Q8_0 reference:
+
+| file | short NLL | Δ | first token | API top-1 | API pairs | long NLL | Δ | first token |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q8_0 recipe, 28.6 GB | 0.2651 | | 94/100 | 0.981 | 0.975 | 0.0943 | | 12/12 |
+| ggml-org Q4_K_M (Q6_K → Q8_0), 19.4 GB | 0.2698 | +1.8% | 89/100 | 0.968 | 0.950 | 0.0956 | +1.4% | 12/12 |
+| all-Q4_K recipe, no imatrix, 15.4 GB | 0.2779 | +4.8% | 87/100 | 0.945 | 0.929 | 0.1178 | +24.9% | 11/12 |
+
+The all-Q4_K recipe fails the bar, badly on long prompts: every long case
+is worse. KLD over the same files: Q4_K_M 0.027 (top-1 94.9%), all-Q4_K
+0.056 (92.7%).
+
+KLD with one tensor class at Q4_K and everything else Q8_0 (no imatrix):
+
+| class at Q4_K | size | KLD | top-1 |
+|---|---:|---:|---:|
+| FFN (17.1 B params) | 20.06 GB | 0.0258 | 95.05% |
+| GDN projections (5.5 B) | 25.85 GB | 0.0191 | 95.83% |
+| attention projections (1.8 B) | 27.78 GB | 0.0151 | 96.65% |
+| output head (1.3 B) | 27.98 GB | 0.0033 | 96.78% |
+| token embedding | 27.98 GB | 0.0003 | 99.22% |
+
+Q4_K_M is FFN at Q4_K and the rest higher: its budget is spent on the FFN.
+The GDN and attention projections are the sensitive classes for their size,
+and errors in them compound over long contexts.
+
 ## Measurements (M4 Pro, 16-core GPU, AC power, High Power Mode)
 
 Reference code prompt, 200 greedy tokens, `Qwen3.8-27B-Q4K-MTP.gguf`:
