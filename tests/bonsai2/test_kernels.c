@@ -774,6 +774,81 @@ static void test_matmul_q4k(uint32_t in_dim, uint32_t out_dim, const uint32_t *t
     free(wr);
 }
 
+/* ---- Q6_K -------------------------------------------------------------- */
+
+static uint64_t map_q6k(uint32_t in_dim, uint32_t out_dim) {
+    const uint64_t blocks = (uint64_t)out_dim * (in_dim / 256u);
+    const uint64_t off = map_place(blocks * 210u);
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint8_t *blk = g_map + off + b * 210u;
+        for (uint32_t i = 0; i < 208u; i++) blk[i] = (uint8_t)rng_next();
+        const _Float16 d = (_Float16)rng_uniform(0.0002f, 0.002f);
+        memcpy(blk + 208, &d, 2);
+    }
+    return off;
+}
+
+/* ggml's Q6_K layout: ql low nibbles, qh high bit pairs, int8 scale per 16 */
+static void q6k_row(const uint8_t *w, uint32_t in_dim, uint32_t o, double *dst) {
+    const uint8_t *row = w + (uint64_t)o * (in_dim / 256u) * 210u;
+    for (uint32_t b = 0; b < in_dim / 256u; b++) {
+        const uint8_t *ql = row + b * 210u, *qh = ql + 128;
+        const int8_t *sc = (const int8_t *)(ql + 192);
+        _Float16 dh;
+        memcpy(&dh, ql + 208, 2);
+        double *y = dst + b * 256u;
+        for (uint32_t n = 0; n < 256u; n += 128u, ql += 64, qh += 32, sc += 8, y += 128) {
+            for (uint32_t l = 0; l < 32u; l++) {
+                const uint32_t is = l / 16u;
+                const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l] = (double)dh * sc[is] * q1;
+                y[l + 32] = (double)dh * sc[is + 2] * q2;
+                y[l + 64] = (double)dh * sc[is + 4] * q3;
+                y[l + 96] = (double)dh * sc[is + 6] * q4;
+            }
+        }
+    }
+}
+
+static void test_matmul_q6k(uint32_t in_dim, uint32_t out_dim, const uint32_t *toks, int n) {
+    const uint64_t w_off = map_q6k(in_dim, out_dim);
+    double *wr = malloc((uint64_t)in_dim * sizeof(double));
+    for (int c = 0; c < n; c++) {
+        const uint32_t n_tok = toks[c];
+        float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
+        ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
+        ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
+        require_ok(ds4_gpu_bonsai2_matmul_q6k_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim, tx, n_tok),
+                   "q6k matmul");
+        float *y = download(ty, (uint64_t)n_tok * out_dim);
+        const uint32_t stride = out_dim > 4096 ? 37u : 1u;
+        double err = 0.0;
+        for (uint32_t o = 0; o < out_dim; o++) {
+            if (o % stride != 0 && o + 8 < out_dim) continue;
+            q6k_row(g_map + w_off, in_dim, o, wr);
+            for (uint32_t t = 0; t < n_tok; t++) {
+                const float *xr = x + (uint64_t)t * in_dim;
+                double sum = 0.0, mag = 0.0;
+                for (uint32_t i = 0; i < in_dim; i++) { sum += wr[i] * xr[i]; mag += fabs(wr[i] * xr[i]); }
+                const double e = fabs((double)y[(uint64_t)t * out_dim + o] - sum) / (mag + 1e-30);
+                if (e > err) err = e;
+            }
+        }
+        char what[96];
+        snprintf(what, sizeof(what), "q6k %s %5u -> %6u  n_tok %u", n_tok > 8 ? "mm " : "mv ", in_dim, out_dim, n_tok);
+        /* the matvec is fp32; the GEMM rounds activations to half */
+        report(what, err, n_tok > 8 ? 1e-3 : 1e-5);
+        free(x);
+        free(y);
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(ty);
+    }
+    free(wr);
+}
+
 /* Time of one projection for n_tok rows: the shared Q4_K path (classic
  * matvec, one pass per row up to 8, GEMM above) against the simdgroup-matrix
  * kernel. */
@@ -906,6 +981,9 @@ int main(int argc, char **argv) {
         test_matmul_q4k(17408, 5120, q4k_toks, 6, mma);
         test_matmul_q4k(5120, 248320, one, 1, mma);
     }
+    const uint32_t q6k_toks[] = { 1, 2, 8, 9, 64 };
+    test_matmul_q6k(5120, 1024, q6k_toks, 5);
+    test_matmul_q6k(6144, 5120, q6k_toks, 5);
     test_gdn_out_silu(1);
     test_gdn_out_silu(3);
     test_gemv_bf16_pair(1);

@@ -54,10 +54,10 @@ all: deepseek4-quantize $(QUANTS_SHARED)
 
 quants-shared: $(QUANTS_SHARED)
 
-deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
+deepseek4-quantize: deepseek4-quantize.c quants.c quants.h quants_q6k.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
-$(QUANTS_SHARED): quants.c quants.h
+$(QUANTS_SHARED): quants.c quants.h quants_q6k.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread
 
 quality-score:

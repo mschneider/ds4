@@ -228,7 +228,7 @@ static void bonsai2_expect_proj(const ds4_tensor *t, uint64_t in_dim, uint64_t o
     uint32_t type = DS4_TENSOR_PQ2_0;
     if (!ds4_model_is_bonsai2() && t) {
         switch (t->type) {
-        case DS4_TENSOR_Q4_K: case DS4_TENSOR_Q8_0: case DS4_TENSOR_Q4_0:
+        case DS4_TENSOR_Q4_K: case DS4_TENSOR_Q6_K: case DS4_TENSOR_Q8_0: case DS4_TENSOR_Q4_0:
         case DS4_TENSOR_BF16: case DS4_TENSOR_F16: case DS4_TENSOR_F32:
             type = t->type;
             break;

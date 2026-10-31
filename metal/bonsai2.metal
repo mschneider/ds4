@@ -670,3 +670,69 @@ kernel void kernel_bonsai2_mm_q4k_rows(
     template [[host_name("kernel_bonsai2_mm_q4k_rows_r" #rt)]] \
     kernel decltype(kernel_bonsai2_mm_q4k_rows<rt>) kernel_bonsai2_mm_q4k_rows<rt>;
 BONSAI2_Q4K_MM(1)
+
+/* --- Q6_K (plain Qwen3.8-27B tensors that need more than 4 bits) -------- */
+
+/* Q6_K matvec, one activation row per grid row: llama.cpp's
+ * kernel_mul_mv_q6_K_f32_impl (MIT) with two simdgroups of two weight rows
+ * and no function constants. */
+kernel void kernel_bonsai2_mv_q6k(
+        constant bonsai2_q4k_mm_args &a [[buffer(0)]],
+        device const char         *w [[buffer(1)]],
+        device const float        *x [[buffer(2)]],
+        device float              *y [[buffer(3)]],
+        uint2  tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+    const int nb = a.in_dim / 256;
+    const uint first_row = (tg.x * 2 + sg) * NR0;
+    if (first_row >= a.out_dim) return;
+    device const block_q6_K *blk = (device const block_q6_K *)(w + (ulong)first_row * a.row_bytes);
+    device const float *yy = x + (ulong)tg.y * a.in_dim;
+    float sumf[NR0] = { 0.f };
+    float yl[16];
+    const short tid = lane / 2, ix = lane % 2, ip = tid / 8, il = tid % 8;
+    const short l0 = 4 * il, is = 8 * ip + l0 / 16;
+    const short y_offset = 128 * ip + l0, q_offset_l = 64 * ip + l0, q_offset_h = 32 * ip + l0;
+    for (int i = ix; i < nb; i += 2) {
+        device const uint8_t *q1 = blk[i].ql + q_offset_l;
+        device const uint8_t *q2 = q1 + 32;
+        device const uint8_t *qh = blk[i].qh + q_offset_h;
+        device const int8_t *sc = (device const int8_t *)blk[i].scales + is;
+        device const half *dh = &blk[i].d;
+        device const float *yv = yy + i * 256 + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4 * l + 0] = yv[l + 0];
+            yl[4 * l + 1] = yv[l + 32];
+            yl[4 * l + 2] = yv[l + 64];
+            yl[4 * l + 3] = yv[l + 96];
+        }
+        for (short row = 0; row < NR0; ++row) {
+            float4 sums = 0.f;
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4 * l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4 * l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4 * l + 2] * ((int8_t)((q1[l] >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4 * l + 3] * ((int8_t)((q2[l] >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            q1 += a.row_bytes;
+            q2 += a.row_bytes;
+            qh += a.row_bytes;
+            sc += a.row_bytes;
+            dh += a.row_bytes / 2;
+        }
+    }
+    for (short row = 0; row < NR0 && first_row + row < a.out_dim; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (lane == 0) y[(ulong)tg.y * a.out_dim + first_row + row] = s;
+    }
+}
+
+/* Prefill: the shared tiled kernel_mul_mm on Q6_K blocks (as the MoE path's
+ * kernel_mul_mm_id_q6_K_f32 instantiates it). */
+template [[host_name("kernel_bonsai2_mul_mm_q6_K_f32")]] kernel mul_mm_t
+kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K,
+              float, float4x4, float, float2x4>;

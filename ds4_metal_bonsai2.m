@@ -303,6 +303,88 @@ int ds4_gpu_bonsai2_mm_q4k_rows_tensor(
                             MTLSizeMake((out_dim + 31) / 32, 1, 1), MTLSizeMake(32, 4, 1), 0);
 }
 
+/* Must match ds4_metal_args_mul_mm in metal/dense.metal. */
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne12;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int16_t  r2;
+    int16_t  r3;
+} bonsai2_mul_mm_args;
+
+/* kernel_mul_mm takes its bounds checks as function constants 700/701
+ * (FC_MUL_MM in metal/dense.metal); one pipeline per combination. */
+static id<MTLComputePipelineState> bonsai2_q6k_mm_pipeline(bool bc_inp, bool bc_out) {
+    static id<MTLComputePipelineState> cache[4];
+    const int k = (bc_inp ? 1 : 0) | (bc_out ? 2 : 0);
+    if (cache[k]) return cache[k];
+    @autoreleasepool {
+        MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new];
+        [fc setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
+        [fc setConstantValue:&bc_out type:MTLDataTypeBool atIndex:701];
+        NSError *err = nil;
+        id<MTLFunction> fn = [ds4_metal_library() newFunctionWithName:@"kernel_bonsai2_mul_mm_q6_K_f32"
+                                                        constantValues:fc error:&err];
+        if (fn) cache[k] = [ds4_metal_device() newComputePipelineStateWithFunction:fn error:&err];
+        if (!cache[k]) fprintf(stderr, "ds4: bonsai2 Q6_K GEMM pipeline: %s\n", err.localizedDescription.UTF8String);
+    }
+    return cache[k];
+}
+
+int ds4_gpu_bonsai2_matmul_q6k_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (n_tok == 0 || in_dim == 0 || in_dim % 256 != 0 || out_dim == 0 || !ds4_gpu_init()) return 0;
+    const uint32_t row_bytes = in_dim / 256 * 210;
+    bonsai2_bind b[3];
+    if (!bonsai2_bind_model(&b[0], model_map, model_size, weight_offset, (uint64_t)out_dim * row_bytes, "Q6_K weight") ||
+        !bonsai2_bind_tensor(&b[1], x, (uint64_t)n_tok * in_dim * sizeof(float), "q6k x") ||
+        !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "q6k out")) {
+        return 0;
+    }
+    if (n_tok <= 8) {
+        const bonsai2_q4k_mm_args args = { in_dim, out_dim, row_bytes, n_tok };
+        return bonsai2_dispatch("kernel_bonsai2_mv_q6k", &args, sizeof(args), b, 3,
+                                MTLSizeMake((out_dim + 3) / 4, n_tok, 1), MTLSizeMake(32, 2, 1), 0);
+    }
+    const bool bc_inp = (in_dim % 32u) != 0;
+    const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+    id<MTLComputePipelineState> pipeline = bonsai2_q6k_mm_pipeline(bc_inp, bc_out);
+    if (!pipeline) return 0;
+    const bonsai2_mul_mm_args args = {
+        .ne00 = (int32_t)in_dim, .ne02 = 1,
+        .nb01 = row_bytes, .nb02 = (uint64_t)row_bytes * out_dim, .nb03 = (uint64_t)row_bytes * out_dim,
+        .ne12 = 1, .nb10 = sizeof(float), .nb11 = (uint64_t)in_dim * sizeof(float),
+        .nb12 = (uint64_t)in_dim * n_tok * sizeof(float), .nb13 = (uint64_t)in_dim * n_tok * sizeof(float),
+        .ne0 = (int32_t)out_dim, .ne1 = (int32_t)n_tok, .r2 = 1, .r3 = 1,
+    };
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        for (int i = 0; i < 3; i++) [enc setBuffer:b[i].buf offset:b[i].off atIndex:(NSUInteger)i + 1];
+        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((n_tok + 31) / 32, (out_dim + 63) / 64, 1)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+        return ds4_metal_finish_command_buffer(cb, owned, "bonsai2 Q6_K GEMM");
+    }
+}
+
 /* Must match struct bonsai2_gdn_out_args in metal/bonsai2.metal. */
 typedef struct {
     uint32_t n_tok;

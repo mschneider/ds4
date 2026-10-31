@@ -49,7 +49,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q3_K]    = { "q3_K",  QK_K, 110, false, false },
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
-    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
+    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, true,  false },   /* fork: quants_q6k.inc */
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
@@ -1149,6 +1149,8 @@ void ds4q_quantize_init(ds4q_type type) {
     }
 }
 
+#include "quants_q6k.inc"
+
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix) {
@@ -1169,6 +1171,9 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_Q4_K) {
         return ds4q_quantize_q4_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q6_K) {
+        return ds4q_quantize_q6_k(src, dst, start, nrows, ncols, imatrix);
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);

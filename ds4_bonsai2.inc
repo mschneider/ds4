@@ -51,8 +51,8 @@ static bool bonsai2_signs_ready(void) {
 }
 
 
-/* A projection, by weight type: PQ2_0 (Bonsai), Q4_K, or the Qwen3.8 dense
- * types (Q8_0, Q4_0, BF16, F16, F32).  rows (0: all) keeps a leading prefix
+/* A projection, by weight type: PQ2_0 (Bonsai), Q4_K, Q6_K, or the Qwen3.8
+ * dense types (Q8_0, Q4_0, BF16, F16, F32).  rows (0: all) keeps a leading prefix
  * of the output rows, for the MTP draft head.  Q4_K takes the classic
  * matvec for one or two rows (one pass each, so a two-row verify row is
  * bit-identical to a decode step) and the simdgroup-matrix product for
@@ -60,8 +60,13 @@ static bool bonsai2_signs_ready(void) {
 static bool bonsai2_mm_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t T, uint32_t rows) {
     if (!rows || rows > w->dim[1]) rows = (uint32_t)w->dim[1];
-    if (w->type != DS4_TENSOR_PQ2_0 && w->type != DS4_TENSOR_Q4_K) return qwen4_gemv_rows(out, m, w, x, T, rows);
     const uint32_t in = (uint32_t)w->dim[0];
+    if (w->type == DS4_TENSOR_Q6_K) {
+        if (ds4_gpu_bonsai2_matmul_q6k_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T)) return true;
+        fprintf(stderr, "ds4: qwen35 Q6_K matmul failed for %.*s (%u tokens)\n", (int)w->name.len, w->name.ptr, T);
+        return false;
+    }
+    if (w->type != DS4_TENSOR_PQ2_0 && w->type != DS4_TENSOR_Q4_K) return qwen4_gemv_rows(out, m, w, x, T, rows);
     const int ok = w->type == DS4_TENSOR_PQ2_0
         ? ds4_gpu_bonsai2_matmul_pq2_tensor(out, m->map, m->size, w->abs_offset, in, rows, x, T)
         : (T >= 3u && T <= 8u &&

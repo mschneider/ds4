@@ -21,6 +21,8 @@ differs. The rules below keep the cost of following upstream small.
 | `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files |
 | `fork.mk` | build rules and fork test targets (included from `Makefile`) |
 | `tests/bonsai2/` | kernel tests, golden reference, reference checker |
+| `tests/qwen38_27b/` | plain 27B golden reference, KLD tool |
+| `gguf-tools/quants_q6k.inc`, `gguf-tools/qwen38_27b_quantize.py` | Q6_K quantizer, 27B recipe tool |
 | `download_bonsai2.sh`, `docs/BONSAI2_27B.md`, this file | |
 
 Upstream files get only **contact points**: one- to three-line hooks that
@@ -36,6 +38,7 @@ Don't fork the refactored code.
 | File | Hook |
 |---|---|
 | `Makefile` | `include fork.mk` after the platform `CORE_OBJS` lists |
+| `gguf-tools/quants.c` | Q6_K marked quantizable, `#include "quants_q6k.inc"` before `ds4q_quantize_chunk`, and its dispatch case |
 | `gguf-tools/Makefile` | `ds4_metal_bonsai2.o` appended to the Darwin `QUALITY_TARGETS`/`QUALITY_OBJS`, so `score_official` links |
 | `ds4.c` | `DS4_VARIANT_BONSAI2 = 200`, `DS4_VARIANT_QWEN38_27B = 201`. Fork variants start at 200 so they never share a KV-cache model id with upstream. |
 | | `#include "ds4_bonsai2_shape.inc"` after `ds4_qwen4_layer_is_nextn` |

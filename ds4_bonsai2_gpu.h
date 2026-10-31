@@ -97,6 +97,13 @@ int ds4_gpu_bonsai2_mm_q4k_rows_tensor(
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok);
 
+/* out[t][o] = W[o] . x[t] for a Q6_K weight (in_dim a multiple of 256): a
+ * matvec pass per row up to 8 rows, the shared tiled GEMM above. */
+int ds4_gpu_bonsai2_matmul_q6k_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok);
+
 /* Plain Qwen3.8-27B (no rotation): GDN output norm and silu(z) gate in place,
  *   o = rms_head(o) * norm * silu(z)
  * o and z are [n_tok][n_head][128] in the scan's tiled V order. */

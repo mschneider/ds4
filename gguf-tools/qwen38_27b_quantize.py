@@ -43,12 +43,17 @@ from pathlib import Path
 
 import numpy as np
 
+import qwen4_pack
 from qwen4_pack import GGMLQuantizer, default_quantizer_library
+
+# Q6_K comes from this fork's quants_q6k.inc; the shared binding predates it.
+qwen4_pack.QTYPE_LAYOUT.setdefault("Q6_K", (256, 210))
+qwen4_pack.DTYPE_TO_QTYPE.setdefault("Q6_K", 14)
 from qwen4_pack_to_qwen4exp import Reader, kv_bytes, tnbytes, w_str
 
 T_F32, T_F16, T_BF16 = 0, 1, 30
 T_Q8_0, T_Q4_K, T_Q6_K = 8, 12, 14
-QTYPES = {"Q8_0": T_Q8_0, "Q4_K": T_Q4_K, "BF16": T_BF16, "F16": T_F16, "F32": T_F32}
+QTYPES = {"Q8_0": T_Q8_0, "Q4_K": T_Q4_K, "Q6_K": T_Q6_K, "BF16": T_BF16, "F16": T_F16, "F32": T_F32}
 ALIGN = 32
 CHUNK_ROWS = 1024
 
@@ -243,10 +248,10 @@ def main() -> int:
             width = dims[0]
             rows = nbytes(t, dims) // nbytes(t, [width])
             src_row = nbytes(t, [width])
-            im = imatrix.get(name) if tt in (T_Q4_K,) else None
+            im = imatrix.get(name) if tt in (T_Q4_K, T_Q6_K) else None
             if im is not None and im.size != width:
                 raise SystemExit(f"imatrix width {im.size} does not match {name}")
-            if tt == T_Q4_K and imatrix and im is None and not name.startswith(f"blk.{args.mtp_layer}.") \
+            if tt in (T_Q4_K, T_Q6_K) and imatrix and im is None and not name.startswith(f"blk.{args.mtp_layer}.") \
                     and name != "token_embd.weight":
                 print(f"warning: no imatrix entry for {name}", flush=True)
             rd.f.seek(rd.data_start + toff)
