@@ -260,8 +260,7 @@ static bool bonsai2_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
  * Bonsai's flash kernel, which stages each K/V tile once per block of
  * query tokens; up to BONSAI2_FA_MIN_TOK tokens the Qwen3.8 decode kernels
  * (key-split partials for 1-2 tokens) stay. */
-#define BONSAI2_FA_MIN_TOK   8u
-#define BONSAI2_FA_ROW_TILES 6u
+#define BONSAI2_FA_MIN_TOK 8u
 static bool bonsai2_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                     uint32_t il, uint32_t pos0, uint32_t T) {
     const uint32_t H = DS4_N_HEAD, Hkv = DS4_N_HEAD_KV, D = DS4_N_HEAD_DIM;
@@ -276,7 +275,7 @@ static bool bonsai2_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
            (T > BONSAI2_FA_MIN_TOK
                 ? ds4_gpu_bonsai2_attn_fa_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
                                                  g->layer_v_cache[il], T, H, Hkv, D, pos0, g->ctx_cap,
-                                                 1.0f / sqrtf((float)D), BONSAI2_FA_ROW_TILES)
+                                                 1.0f / sqrtf((float)D))
                 : ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
                                                    g->layer_v_cache[il], NULL, NULL,
                                                    T <= 2u ? g->attn_part : NULL, T, H, Hkv, D, pos0,

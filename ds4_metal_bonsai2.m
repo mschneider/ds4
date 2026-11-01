@@ -378,21 +378,24 @@ typedef struct {
     float scale;
 } bonsai2_fa_args;
 
+/* Must match BONSAI2_FA_NRT in metal/bonsai2.metal: rows per threadgroup
+ * in tiles of 8, two simdgroups per tile. */
+#define BONSAI2_FA_NRT 3u
+
 int ds4_gpu_bonsai2_attn_fa_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, uint32_t cache_cap, float scale, uint32_t row_tiles) {
+        uint32_t pos0, uint32_t cache_cap, float scale) {
     if (n_tok == 0) return 1;
     const uint32_t group = n_head_kv ? n_head / n_head_kv : 0;
-    if (head_dim != 256 || n_head_kv == 0 || n_head % n_head_kv != 0 ||
-        (row_tiles != 3 && row_tiles != 6) || group == 0 || group > 8u * row_tiles ||
-        (uint64_t)pos0 + n_tok > cache_cap) {
+    if (head_dim != 256 || n_head_kv == 0 || n_head % n_head_kv != 0 || group == 0 ||
+        group > 8u * BONSAI2_FA_NRT || (uint64_t)pos0 + n_tok > cache_cap) {
         fprintf(stderr, "ds4: bonsai2 flash attention shape is unsupported\n");
         return 0;
     }
     if (!ds4_gpu_init()) return 0;
-    const uint32_t tok_per_tg = 8u * row_tiles / group;
+    const uint32_t tok_per_tg = 8u * BONSAI2_FA_NRT / group;
     const bonsai2_fa_args args = { n_tok, n_head, n_head_kv, pos0, tok_per_tg, scale };
     const uint64_t q_bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
@@ -404,8 +407,7 @@ int ds4_gpu_bonsai2_attn_fa_tensor(
         !bonsai2_bind_tensor(&b[4], out, q_bytes, "attn out")) {
         return 0;
     }
-    return bonsai2_dispatch(row_tiles == 6 ? "kernel_bonsai2_attn_fa_r6" : "kernel_bonsai2_attn_fa_r3",
-                            &args, sizeof(args), b, 5,
+    return bonsai2_dispatch("kernel_bonsai2_attn_fa", &args, sizeof(args), b, 5,
                             MTLSizeMake(n_head_kv, (n_tok + tok_per_tg - 1) / tok_per_tg, 1),
-                            MTLSizeMake(64u * row_tiles, 1, 1), 0);
+                            MTLSizeMake(64u * BONSAI2_FA_NRT, 1, 1), 0);
 }

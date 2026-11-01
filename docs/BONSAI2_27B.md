@@ -68,7 +68,7 @@ graph and these kernels are Bonsai's own:
 | `swiglu_rotate`, `rotate`, `unrotate` | FFN down input, attention output input, embedding inverse |
 | `gemv_bf16_pair` | GDN alpha/beta BF16 projections while decoding |
 | `attn_prep` | q/k norm + rope + gate split without the Qwen3.8 Flash Next indexer |
-| `attn_fa_r3` / `attn_fa_r6` | Prefill attention (9+ tokens), flash style: one threadgroup per (KV head, block of 8 query tokens) shares each staged K/V tile among all 48 (token, head) rows; decode keeps the Qwen3.8 kernels |
+| `attn_fa` | Prefill attention (9+ tokens), flash style: one threadgroup per (KV head, block of 4 query tokens) shares each staged K/V tile among all 24 (token, head) rows; decode keeps the Qwen3.8 kernels |
 
 ## Verification
 
@@ -106,24 +106,30 @@ chunks come from `DS4_QWEN4_PREFILL_CHUNK`; `--prefill-chunk` does not apply.
 
 ### Prefill attention
 
-Bonsai's 16 full-attention layers prefill with `attn_fa_r6` instead of the
+Bonsai's 16 full-attention layers prefill with `attn_fa` instead of the
 Qwen3.8 kernel, which ran one threadgroup per (KV head, token): every token
 re-read the whole K/V history, and its 6 query heads were padded to 16
-matrix rows. The flash kernel stages each K/V tile once for 8 tokens x 6
-heads = 48 rows and keeps the same inner loop, so its output is bit-identical
-(the kernel tests compare against the old kernel exactly). One layer, M4 Pro:
+matrix rows. The flash kernel stages each K/V tile once for 4 tokens x 6
+heads = 24 rows and keeps the same inner loop, so its output is
+bit-identical (the kernel tests compare against the old kernel exactly).
+One layer, M4 Pro (`tests/bonsai2/test_kernels --bench-attn`):
 
-| tokens | Qwen3.8 kernel | `attn_fa_r3` | `attn_fa_r6` |
-|---:|---:|---:|---:|
-| 512 | 4.65 ms | 2.34 ms | 2.64 ms |
-| 2048 | 61.6 ms | 32.1 ms | 33.3 ms |
-| 4096 | 240 ms | 134 ms | 131 ms |
-| 8192 | 950 ms | 541 ms | 513 ms |
+| tokens | Qwen3.8 kernel | `attn_fa` |
+|---:|---:|---:|
+| 512 | 4.67 ms (0.69 TFLOPS) | 1.54 ms (2.10) |
+| 2048 | 61.6 ms (0.84) | 16.4 ms (3.14) |
+| 4096 | 237 ms (0.87) | 62.9 ms (3.28) |
+| 8192 | 913 ms (0.90) | 242 ms (3.41) |
+
+The shape came from a sweep at 4096 tokens (TFLOPS): queries in registers
+instead of threadgroup memory 1.5 (register pressure), 48 rows 1.5–1.6, K
+and V staged together 1.6, 16 rows 2.4, 32 rows 2.9, 24 rows with K then V
+through one 8 KB buffer 3.3. Addressing that buffer through pointer aliases
+instead of the array itself is worth 3.3 vs 2.95 (Metal codegen; the kernel
+says so where it matters).
 
 Whole-model prefill, default chunk, interleaved runs, same greedy output:
-4069 tokens 100.2 → 104.7 t/s, about 16k tokens 79.4 → 91.9 t/s. Attention
-was about 9% of a 4k prefill (per-op profile); at about 1.6 TFLOPS it is
-still well below the GEMMs, so a deeper rewrite has room left.
+4069 tokens about 100 → 107.8 t/s, about 16k tokens 79.8 → 101.2 t/s.
 
 ### Against PrismML llama.cpp
 
