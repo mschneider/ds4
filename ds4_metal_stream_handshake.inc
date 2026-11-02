@@ -1,30 +1,37 @@
-/* Event handshake for streamed Qwen decode layers (fork).
+/* Handshake for streamed Qwen decode layers (fork).
  *
  * The ordinary streamed MoE drains the GPU at every layer so the CPU can
  * read the router's expert ids, load the missing experts and bind them.
- * With DS4_QWEN4_STREAM_HANDSHAKE=1 a layer of one to three tokens (decode
- * and MTP verification) is instead encoded
+ * With DS4_QWEN4_STREAM_HANDSHAKE=1 a single-token decode layer (or, see
+ * g_qwen4_hs_max_tokens, an MTP verification layer) is instead encoded
  * without knowing its experts:
  *
- *   ... router(l) | signal(v) | wait(v + 1) | experts(l) via the layer's
- *   expert address table | reduce ...
+ *   ... router(l) | copy ids to the arrival words || commit
+ *   wait(v) | experts(l) via the layer's expert address table | reduce ...
  *
- * and committed at once. The CPU keeps encoding the next layer and only then
- * services layer l: it waits for v, reads the ids, loads what is missing
- * into the expert cache, writes their addresses into the table and sets
- * v + 1, which releases the GPU. The GPU thus runs ahead by a layer instead
- * of idling through every drain, wake-up and encode.
+ * The CPU encodes the next layer, then services layer l: it spins until the
+ * arrival words hold the ids (they reach memory when the first command
+ * buffer completes, sooner than a shared-event signal is seen; the CPU
+ * resets them after reading), loads the missing experts, writes their
+ * addresses and sets v, which releases the GPU.
+ *
+ * The CPU writes expert payloads and addresses after the command buffer
+ * that reads them was committed, so that command buffer must not touch the
+ * expert cache before its wait: it starts with the wait. The GPU therefore
+ * stays stopped while experts load. (Running the cached experts during the
+ * loads, as the ordinary path does, changed the output: the GPU can keep
+ * stale cache lines of slots the CPU rewrites while it runs.)
  *
  * Safety:
  * - The expert kernels reach the cache only through the address table and
  *   the slab buffers, which are all made resident at encode time; the
  *   handshake first allocates every slab of the cache budget.
- * - When the CPU sees v, the GPU has finished everything before router(l),
- *   so experts of earlier layers can be evicted; layer l's own selection is
- *   protected by the load. Handshake layers do not mark entries in flight,
- *   and the first handshake layer after an ordinary one drains once, so no
- *   load ever waits for in-flight GPU work (which would wait on the GPU
- *   that waits on the CPU).
+ * - When the CPU sees layer l's ids, the GPU has finished everything that
+ *   router(l) depends on, including layer l - 1's experts, so earlier layers'
+ *   experts can be evicted; layer l's own experts are protected by its load.
+ *   Handshake layers do not mark entries in flight, and the first handshake
+ *   layer after an ordinary one drains once, so no load ever waits for
+ *   in-flight GPU work (which would wait on the GPU that waits on the CPU).
  * - Every command-buffer wait first services pending layers
  *   (ds4_gpu_wait_command_buffer), so nothing can wait on a blocked GPU.
  * - A failed load still releases the GPU, with the failed experts pointed at
@@ -37,13 +44,14 @@
 
 typedef struct {
     ds4_gpu_stream_expert_table table;
-    uint64_t value;
-    const volatile int32_t *ids;
+    uint64_t value;                   /* releases the layer's experts */
     uint32_t n_ids;
 } qwen4_handshake_layer;
 
 static id<MTLSharedEvent> g_qwen4_hs_event;
 static uint64_t g_qwen4_hs_value;
+static id<MTLBuffer> g_qwen4_hs_words_buffer;
+static volatile uint32_t *g_qwen4_hs_words;
 static qwen4_handshake_layer g_qwen4_hs_pending[2];
 static uint32_t g_qwen4_hs_n_pending;
 static int g_qwen4_hs_servicing;
@@ -51,25 +59,33 @@ static int g_qwen4_hs_failed;
 static int g_qwen4_hs_dirty = 1;  /* an ordinary layer ran since the last drain */
 /* DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1 prints these at exit. */
 static struct {
-    uint64_t layers, ordinary, not_full, drains;
-    double wait_ms, service_ms;
+    uint64_t layers, ordinary, not_full, drains, missing_layers;
+    double wait_ms, service_ms, load_ms;
 } g_qwen4_hs_stats;
 
 static void qwen4_handshake_report(void) {
     const typeof(g_qwen4_hs_stats) *s = &g_qwen4_hs_stats;
+    const double n = s->layers ? (double)s->layers : 1.0;
     fprintf(stderr, "ds4: Qwen decode handshake: layers=%llu ordinary=%llu (cache not full %llu) "
-            "drains=%llu CPU wait for GPU %.3f ms/layer, service %.3f ms/layer\n",
+            "drains=%llu with misses=%llu; per layer: CPU wait for GPU %.3f ms, service %.3f ms, "
+            "of which loads %.3f ms\n",
             (unsigned long long)s->layers, (unsigned long long)s->ordinary,
             (unsigned long long)s->not_full, (unsigned long long)s->drains,
-            s->layers ? s->wait_ms / (double)s->layers : 0.0,
-            s->layers ? s->service_ms / (double)s->layers : 0.0);
+            (unsigned long long)s->missing_layers, s->wait_ms / n, s->service_ms / n, s->load_ms / n);
 }
+
+/* MTP verification steps (two or three tokens) miss more experts and the GPU
+ * waits for every load, which measured slower than the ordinary path; they
+ * use the handshake only with DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS=2 or 3. */
+static uint32_t g_qwen4_hs_max_tokens = 1u;
 
 static int qwen4_stream_handshake_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
         enabled = env && strcmp(env, "1") == 0;
+        g_qwen4_hs_max_tokens = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS",
+                                                          1u, 1u, QWEN4_HS_MAX_TOKENS);
         if (enabled && getenv("DS4_QWEN4_STREAM_HANDSHAKE_PROFILE")) atexit(qwen4_handshake_report);
     }
     return enabled;
@@ -88,7 +104,10 @@ static void qwen4_handshake_service(const qwen4_handshake_layer *h) {
     const ds4_gpu_stream_expert_table *t = &h->table;
     const double t0 = ds4_gpu_now_ms();
     uint32_t spins = 0;
-    while (g_qwen4_hs_event.signaledValue < h->value) {
+    for (;;) {
+        int arrived = 1;
+        for (uint32_t i = 0; i < h->n_ids; i++) arrived &= g_qwen4_hs_words[i] != UINT32_MAX;
+        if (arrived) break;
         if (++spins > (1u << 14)) {
             spins = 0;
             sched_yield();
@@ -106,8 +125,9 @@ static void qwen4_handshake_service(const qwen4_handshake_layer *h) {
     uint32_t n_unique = 0;
     int ok = !g_qwen4_hs_failed;
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = {0};
-    for (uint32_t i = 0; ok && i < h->n_ids; i++) {
-        ids[i] = h->ids[i];
+    for (uint32_t i = 0; i < h->n_ids; i++) {
+        ids[i] = (int32_t)g_qwen4_hs_words[i];
+        g_qwen4_hs_words[i] = UINT32_MAX;
         if (ids[i] < 0 || (uint32_t)ids[i] >= t->n_total_expert) ok = 0;
         else if (frequency[ids[i]]++ == 0) unique[n_unique++] = ids[i];
     }
@@ -115,24 +135,27 @@ static void qwen4_handshake_service(const qwen4_handshake_layer *h) {
         ds4_gpu_stream_expert_cache_note_token(t->layer);
         ds4_gpu_stream_expert_cache_note_frequency_hotness(t->layer, frequency, t->n_total_expert);
     }
-    /* One load protects only its own selection, so a multi-token step loads
-     * its experts in chunks and then checks that all of them are present,
-     * reloading any that a later chunk evicted. */
+
+    /* One load protects only its own selection, so a multi-token step with
+     * more unique experts loads in chunks and reloads any that a later chunk
+     * evicted. */
     ds4_gpu_stream_expert_cache_entry *entry[QWEN4_HS_MAX_IDS];
+    const uint32_t n_protect = n_unique < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ?
+        n_unique : DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED;
+    const double t2 = ds4_gpu_now_ms();
     for (uint32_t attempt = 0; ok; attempt++) {
         int32_t missing[QWEN4_HS_MAX_IDS];
         uint32_t n_missing = 0;
         for (uint32_t i = 0; i < n_unique; i++) {
             const uint64_t e = (uint64_t)(uint32_t)unique[i];
             entry[i] = ds4_gpu_stream_expert_cache_peek(
-                t->model_map, t->model_size, t->layer, (uint32_t)e, t->n_total_expert,
-                n_unique < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ?
-                    n_unique : DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED,
+                t->model_map, t->model_size, t->layer, (uint32_t)e, t->n_total_expert, n_protect,
                 t->gate_offset + e * t->gate_expert_bytes, t->up_offset + e * t->gate_expert_bytes,
                 t->down_offset + e * t->down_expert_bytes, t->gate_expert_bytes, t->down_expert_bytes);
             if (!entry[i]) missing[n_missing++] = unique[i];
         }
         if (n_missing == 0) break;
+        if (attempt == 0) g_qwen4_hs_stats.missing_layers++;
         if (attempt == 4) {
             ok = 0;
             break;
@@ -145,6 +168,7 @@ static void qwen4_handshake_service(const qwen4_handshake_layer *h) {
             ds4_gpu_stream_expert_pending_load_clear();
         }
     }
+    g_qwen4_hs_stats.load_ms += ds4_gpu_now_ms() - t2;
     for (uint32_t i = 0; ok && i < n_unique; i++) {
         ok = entry[i]->slab_backed &&
              ds4_gpu_stream_expert_cache_set_addr_slot_raw(t->layer, (uint32_t)unique[i],
@@ -155,13 +179,12 @@ static void qwen4_handshake_service(const qwen4_handshake_layer *h) {
         qwen4_handshake_fail("an expert could not be loaded into the cache");
         id<MTLBuffer> any = g_stream_expert_cache_slabs[0];
         for (uint32_t i = 0; i < h->n_ids; i++) {
-            ids[i] = h->ids[i];
             if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert)
                 (void)ds4_gpu_stream_expert_cache_set_addr_slot_raw(t->layer, (uint32_t)ids[i],
                                                                     any, 0, any, 0, any, 0);
         }
     }
-    g_qwen4_hs_event.signaledValue = h->value + 1u;
+    g_qwen4_hs_event.signaledValue = h->value;
     g_qwen4_hs_stats.service_ms += ds4_gpu_now_ms() - t1;
 }
 
@@ -231,8 +254,8 @@ static int qwen4_handshake_reserve_slabs(uint64_t gate_expert_bytes, uint64_t do
 }
 
 /* Encodes one streamed decode or verify layer (up to three tokens) with the
- * handshake. Returns 0 when
- * the layer does not qualify (the ordinary path runs), else 1 with *ok set. */
+ * handshake. Returns 0 when the layer does not qualify (the ordinary path
+ * runs), else 1 with *ok set. */
 static int qwen4_stream_handshake_layer(
         int *ok, int had_batch, const ds4_gpu_stream_expert_table *table,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
@@ -242,15 +265,14 @@ static int qwen4_stream_handshake_layer(
         uint32_t shared_type, uint32_t shared_down_type) {
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
     if (!qwen4_stream_handshake_enabled() || !had_batch || !g_batch_cb ||
-        n_tokens == 0 || n_tokens > QWEN4_HS_MAX_TOKENS ||
+        n_tokens == 0 || n_tokens > g_qwen4_hs_max_tokens ||
         n_slots > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || gate_type == 12u ||
         !ds4_gpu_stream_expert_slab_enabled() ||
         !ds4_gpu_stream_expert_cache_note_expert_size(table->gate_expert_bytes, table->down_expert_bytes) ||
         (g_stream_expert_cache_slab_total_slots < budget &&
          !qwen4_handshake_reserve_slabs(table->gate_expert_bytes, table->down_expert_bytes)) ||
         budget == 0 || g_stream_expert_cache_slab_count == 0 ||
-        ds4_gpu_stream_expert_cache_effective_cap(table->layer, table->n_total_expert, n_slots) == 0 ||
-        !ds4_gpu_tensor_contents((ds4_gpu_tensor *)selected)) {
+        ds4_gpu_stream_expert_cache_effective_cap(table->layer, table->n_total_expert, n_slots) == 0) {
         if (qwen4_stream_handshake_enabled()) {
             g_qwen4_hs_stats.ordinary++;
             g_qwen4_hs_stats.not_full += budget == 0 || g_stream_expert_cache_slab_total_slots < budget;
@@ -260,10 +282,15 @@ static int qwen4_stream_handshake_layer(
     }
     if (!g_qwen4_hs_event) {
         g_qwen4_hs_event = [g_device newSharedEvent];
-        if (!g_qwen4_hs_event) {
+        g_qwen4_hs_words_buffer = [g_device newBufferWithLength:QWEN4_HS_MAX_IDS * sizeof(uint32_t)
+                                                       options:MTLResourceStorageModeShared];
+        if (!g_qwen4_hs_event || !g_qwen4_hs_words_buffer) {
+            g_qwen4_hs_event = nil;
             g_qwen4_hs_dirty = 1;
             return 0;
         }
+        g_qwen4_hs_words = (volatile uint32_t *)[g_qwen4_hs_words_buffer contents];
+        memset((void *)g_qwen4_hs_words, 0xff, QWEN4_HS_MAX_IDS * sizeof(uint32_t));
         g_qwen4_hs_value = g_qwen4_hs_event.signaledValue;
     }
     if (g_qwen4_hs_dirty) {
@@ -282,17 +309,25 @@ static int qwen4_stream_handshake_layer(
 
     if (g_qwen4_hs_n_pending >= 2u) qwen4_handshake_service_pending(0);
     ds4_gpu_close_batch_encoder();
+    id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+    [blit copyFromBuffer:ds4_gpu_tensor_buffer(selected) sourceOffset:ds4_gpu_tensor_offset(selected)
+                toBuffer:g_qwen4_hs_words_buffer destinationOffset:0
+                    size:(NSUInteger)n_tokens * n_slots * sizeof(uint32_t)];
+    [blit endEncoding];
+    g_batch_has_work = YES;
+    /* The words reach memory when this command buffer completes; the next
+     * one starts with the wait, before anything reads the expert cache. */
+    if (!ds4_gpu_flush_commands()) {
+        *ok = 0;
+        return 1;
+    }
     const uint64_t value = ++g_qwen4_hs_value;
-    ++g_qwen4_hs_value;
-    [g_batch_cb encodeSignalEvent:g_qwen4_hs_event value:value];
-    [g_batch_cb encodeWaitForEvent:g_qwen4_hs_event value:value + 1u];
+    [g_batch_cb encodeWaitForEvent:g_qwen4_hs_event value:value];
     g_batch_has_work = YES;
     g_qwen4_hs_stats.layers++;
     /* Recorded before anything else can fail: the GPU now waits for it. */
     g_qwen4_hs_pending[g_qwen4_hs_n_pending++] = (qwen4_handshake_layer) {
-        .table = *table, .value = value,
-        .ids = (const volatile int32_t *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)selected),
-        .n_ids = n_tokens * n_slots,
+        .table = *table, .value = value, .n_ids = n_tokens * n_slots,
     };
 
     qwen4_stream_weights stream = {
@@ -309,10 +344,9 @@ static int qwen4_stream_handshake_layer(
             n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset, shared_up_offset, shared_type) &&
           ds4_gpu_qwen4_moe_down_tensor(part, mid, selected, table->model_map, table->model_size,
             table->down_offset, down_type, table->n_total_expert,
-            n_tokens, n_slots, ff_dim, in_dim, shared_down_offset, shared_down_type) &&
-          ds4_gpu_flush_commands();
+            n_tokens, n_slots, ff_dim, in_dim, shared_down_offset, shared_down_type);
     g_qwen4_stream_weights = NULL;
-    /* Layer l is queued; service layer l - 1 while the GPU runs up to l. */
+    /* Service layer l - 1 while the GPU runs up to layer l's router. */
     qwen4_handshake_service_pending(1);
     if (g_qwen4_hs_failed) *ok = 0;
     return 1;
