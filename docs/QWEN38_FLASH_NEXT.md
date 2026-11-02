@@ -244,6 +244,20 @@ truncated pack. On the Q2 pack a greedy 96-token generation with
 `DS4_EXPERT_PACK_VERIFY=1` matched the model byte for byte and produced the
 same text as `DS4_EXPERT_PACK=0`.
 
+Measured on an M4 Pro 48 GB (AC power, High Power Mode), Q2, `ds4-bench
+--ssd-streaming --ctx-start 4096 --ctx-max 4096 --ctx-alloc 32768
+--prefill-chunk 4096 --gen-tokens 128`, three interleaved runs per arm,
+medians:
+
+| | Prefill 4K (t/s) | Decode 128 (t/s) | Steady decode (t/s) |
+| --- | ---: | ---: | ---: |
+| Model file | 186.4 | 19.00 | 20.50 |
+| Expert pack | 197.9 | 19.44 | 20.66 |
+
+Prefill, which misses the cache for most experts, gained 6%; decode at 4K,
+where the 13 GiB expert cache serves most experts, gained 1 to 2%. The
+macOS page cache was not purged between runs and swap held about 18 GiB.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3
