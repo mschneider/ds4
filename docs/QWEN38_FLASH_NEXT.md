@@ -296,8 +296,25 @@ experts are encoded (`ds4_metal_stream_overlap.inc`;
 is byte-identical. A 512-token prompt run with `DS4_METAL_CB_TIMES=1` went
 from 0.21 ms CPU encode + 1.13 ms drain wait per layer to 0.11 + 0.82 ms,
 about 18 ms less per token. About 0.25 ms per layer is still the drain's
-launch and wake-up latency; removing it needs the per-layer event handshake
-in one command buffer (not implemented).
+launch and wake-up latency.
+
+`DS4_QWEN4_STREAM_HANDSHAKE=1` (`ds4_metal_stream_handshake.inc`, off by
+default) removes that drain for decode and MTP verification (one to three
+tokens): the layer is encoded as router, GPU signal, GPU wait for the CPU,
+then the experts through the layer's expert address table, and committed at
+once. The CPU encodes the next layer, then waits for the signal, loads the
+missing experts, writes their addresses and releases the GPU. It first
+allocates the whole cache budget's slabs (slots stay unlocked until used),
+because the kernels must see every slab when they are encoded. Greedy output
+matched byte for byte with and without `--mtp`. In `ds4-bench` (4K prompt,
+256K allocation) steady decode was 21.1, 21.1 and 21.2 tok/s against 20.0,
+19.6 and 20.1 with early commit alone; `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1`
+showed the CPU waiting 0.91 ms per layer for the GPU and servicing a layer
+in 0.10 ms, so decode is now bound by GPU work rather than drains. CLI runs
+did not show the gain (warm 4K prompt, 256 tokens: 18.2 against 18.1
+without MTP, 19.0 and 16.8 against 18.9 and 19.0 with `--mtp`), and with a
+cold cache the GPU idles during every load, where the ordinary path runs the
+cached experts while the missing ones load. Hence opt-in.
 
 `DS4_STREAM_NOCACHE=1` (`ds4_stream_nocache.inc`, off by default) reads
 streamed experts through a second F_NOCACHE descriptor of the model and the
