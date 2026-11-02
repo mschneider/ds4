@@ -87,6 +87,25 @@ generated token. The top-5 logprob drift is ≤ 0.012 (gate 0.05).
 
 ## Performance
 
+### Decode
+
+Single-session greedy decode, M4 Pro (16-core GPU, 48 GB) on AC in High
+Power Mode, 256 generated tokens after the prompt, `ff2c766`
+(`./ds4 -c 20000 -n 256 --temp 0 -p ...`):
+
+| context before decode | decode |
+|---|---:|
+| ~90 tokens | 28.5 t/s (3 runs: 28.53, 28.50, 28.45) |
+| 4069 tokens | 25.4–25.8 t/s (2 runs) |
+| ~16k tokens | 21.7 t/s (1 run) |
+
+Decode runs the PQ2_0 matvec kernels (`mv_pq2`, 1–8 tokens) and the
+Qwen3.8 attention decode kernels; the prefill work below does not touch
+them. At short context it is bound by streaming the weights (the 7.2 GB
+file at 28.5 t/s is about 200 GB/s, an upper bound since the embedding table
+is read one row per token); the drop with context is the 16 attention
+layers reading the growing KV cache.
+
 ### Prefill GEMM
 
 Projections are about 85% of prefill time (per-op profile of a 4069-token
@@ -301,5 +320,5 @@ see `metal/bonsai2.metal`) and streams at about the copy rate in short bursts:
 Low Power Mode the GPU clock drops after a burst. The same kernel run 3000
 times back to back takes 0.23 ms per call, and in the model it averages
 0.17 ms. Decode numbers therefore depend on power state and thermals more
-than on the kernels. Re-measure with Low Power Mode off before quoting
-absolute figures.
+than on the kernels. The table above is from Low Power Mode; see
+[Decode](#decode) for High Power Mode figures (28.5 t/s at short context).
