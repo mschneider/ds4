@@ -30,6 +30,10 @@ NSUInteger ds4_metal_tensor_offset(const ds4_gpu_tensor *tensor);
 id<MTLBuffer> ds4_metal_wrap_model_range(const void *model_map, uint64_t model_size,
                                          uint64_t offset, uint64_t len, uint64_t *inner_offset);
 
+/* Whether upstream's GEMMs use Metal 4 tensor ops (M5 and later, unless
+ * disabled by DS4_METAL_DISABLE_METAL4 or quality mode). */
+int ds4_metal_tensor_ops_available(void);
+
 /* Upstream's F16 x F32 GEMM (n_tok > 8 only) on an F16 weight held in a GPU
  * buffer: out_dim rows of in_dim halves starting at woff. */
 int ds4_metal_matmul_f16_buffer(ds4_gpu_tensor *out, id<MTLBuffer> wbuf, NSUInteger woff,

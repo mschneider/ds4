@@ -10,6 +10,9 @@
 #import <Metal/Metal.h>
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
 
 #include "ds4_metal_internal.h"
 #include "ds4_bonsai2_gpu.h"
@@ -36,6 +39,7 @@ typedef struct {
     uint32_t perm_rep;
     uint32_t write_xn;
     float    eps;
+    uint32_t half_out;
 } bonsai2_rot_args;
 
 /* Above this many activation rows the matmul switches to the tiled GEMM.
@@ -57,10 +61,45 @@ typedef struct {
  * The scratch holds one matrix and is reused by every call.  Bonsai never
  * opens a concurrent encoder, so each unpack waits for the previous GEMM. */
 #define BONSAI2_UNPACK_MAX_BYTES (512ull << 20)
-static uint32_t g_bonsai2_unpack_min_tok = 512u;
+static uint32_t g_bonsai2_unpack_min_tok = 2048u;
 static id<MTLBuffer> g_bonsai2_unpack;
 
-void ds4_gpu_bonsai2_set_unpack_min_tokens(uint32_t n_tok) { g_bonsai2_unpack_min_tok = n_tok; }
+static void bonsai2_gemm_env(void);
+
+void ds4_gpu_bonsai2_set_unpack_min_tokens(uint32_t n_tok) {
+    bonsai2_gemm_env();
+    g_bonsai2_unpack_min_tok = n_tok;
+}
+
+/* From this many rows on, the rotations write the prefill GEMM inputs as
+ * half (the value the GEMM would round them to) and the GEMM reads half. */
+static uint32_t g_bonsai2_half_act_min_tok = BONSAI2_MV_MAX_TOK + 1u;
+
+void ds4_gpu_bonsai2_set_half_act_min_tokens(uint32_t n_tok) {
+    bonsai2_gemm_env();
+    g_bonsai2_half_act_min_tok = n_tok;
+}
+
+/* From this many rows on, the prefill GEMM unpacks to F16 and runs
+ * upstream's kernel_mul_mm_f16_f32, which uses Metal 4 tensor ops on M5 and
+ * later (off by default: on M1-M4 it is the plain simdgroup GEMM the family
+ * already beats).  It reads float activations, so half activations stay off
+ * from this size on. */
+static uint32_t g_bonsai2_upstream_min_tok = UINT32_MAX;
+
+void ds4_gpu_bonsai2_set_upstream_min_tokens(uint32_t n_tok) {
+    bonsai2_gemm_env();
+    g_bonsai2_upstream_min_tok = n_tok;
+}
+
+static int bonsai2_use_upstream(uint32_t n_tok) {
+    return n_tok > BONSAI2_MV_MAX_TOK && n_tok >= g_bonsai2_upstream_min_tok;
+}
+
+static int bonsai2_act_half(uint32_t n_tok) {
+    bonsai2_gemm_env();
+    return n_tok > BONSAI2_MV_MAX_TOK && n_tok >= g_bonsai2_half_act_min_tok && !bonsai2_use_upstream(n_tok);
+}
 
 void ds4_gpu_bonsai2_release(void) { g_bonsai2_unpack = nil; }
 
@@ -123,6 +162,183 @@ static int bonsai2_dispatch(const char *kernel, const void *args, NSUInteger arg
     }
 }
 
+/* Prefill GEMM family (metal/bonsai2.metal kernel_bonsai2_gemm): tile
+ * shapes x {PQ2_0 or F16 weights} x {F32 or F16 activations} x {prefetch}. */
+typedef struct {
+    char name[32];
+    uint16_t bm, bn, wm, wn;
+    uint8_t aq, bh, pf;
+} bonsai2_gemm_cfg;
+
+static const uint16_t g_bonsai2_gemm_tiles[][4] = {
+    {64, 32, 2, 2}, {64, 64, 2, 2}, {64, 64, 2, 4}, {128, 32, 4, 2}, {128, 64, 4, 2},
+    {64, 128, 2, 4}, {128, 64, 4, 4}, {128, 128, 4, 4}, {32, 64, 1, 2},
+};
+#define BONSAI2_GEMM_NTILE (sizeof(g_bonsai2_gemm_tiles) / sizeof(g_bonsai2_gemm_tiles[0]))
+
+static int bonsai2_gemm_cfg_get(uint32_t i, bonsai2_gemm_cfg *c) {
+    if (i >= BONSAI2_GEMM_NTILE * 8) return 0;
+    const uint16_t *t = g_bonsai2_gemm_tiles[i / 8];
+    const uint32_t v = i % 8;
+    c->bm = t[0]; c->bn = t[1]; c->wm = t[2]; c->wn = t[3];
+    c->aq = v < 4; c->bh = (v / 2) % 2; c->pf = v % 2;
+    snprintf(c->name, sizeof(c->name), "%ux%u_%ux%u_%c%c%c", c->bm, c->bn, c->wm, c->wn,
+             c->aq ? 'q' : 'f', c->bh ? 'h' : 'f', c->pf ? 'p' : 'n');
+    return 1;
+}
+
+uint32_t ds4_gpu_bonsai2_gemm_cfg_count(void) { return (uint32_t)(BONSAI2_GEMM_NTILE * 8); }
+
+const char *ds4_gpu_bonsai2_gemm_cfg_name(uint32_t i, int *half_x) {
+    static char names[BONSAI2_GEMM_NTILE * 8][32];
+    bonsai2_gemm_cfg c;
+    if (!bonsai2_gemm_cfg_get(i, &c)) return NULL;
+    memcpy(names[i], c.name, sizeof(c.name));
+    if (half_x) *half_x = c.bh;
+    return names[i];
+}
+
+
+/* Runs configuration c; b = { PQ2_0 weight, x, out }.  F16-weight
+ * configurations unpack the weight into the shared scratch first. */
+static int bonsai2_gemm_run(const bonsai2_gemm_cfg *c, const bonsai2_mm_args *args, bonsai2_bind b[3]) {
+    if (!c->aq) {
+        const uint64_t f16_bytes = (uint64_t)args->out_dim * args->in_dim * sizeof(uint16_t);
+        id<MTLBuffer> scratch = bonsai2_unpack_scratch(f16_bytes);
+        if (!scratch) return 0;
+        bonsai2_bind ub[2] = { b[0], { scratch, 0 } };
+        const uint64_t n_words = (uint64_t)args->out_dim * (args->in_dim / 8);
+        if (!bonsai2_dispatch("kernel_bonsai2_unpack_pq2_f16", args, sizeof(*args), ub, 2,
+                              MTLSizeMake((NSUInteger)((n_words + 255) / 256), 1, 1),
+                              MTLSizeMake(256, 1, 1), 0)) {
+            return 0;
+        }
+        b[0] = (bonsai2_bind){ scratch, 0 };
+    }
+    char kname[64];
+    snprintf(kname, sizeof(kname), "kernel_bonsai2_gemm_%s", c->name);
+    const NSUInteger shmem = (NSUInteger)(c->bm + c->bn) * 32u * 2u;
+    return bonsai2_dispatch(kname, args, sizeof(*args), b, 3,
+                            MTLSizeMake((args->n_tok + c->bn - 1) / c->bn, (args->out_dim + c->bm - 1) / c->bm, 1),
+                            MTLSizeMake(32u * c->wm * c->wn, 1, 1), shmem < 4096 ? 4096 : shmem);
+}
+
+int ds4_gpu_bonsai2_matmul_cfg_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok, uint32_t cfg) {
+    bonsai2_gemm_cfg c;
+    if (!bonsai2_gemm_cfg_get(cfg, &c) || n_tok == 0 || in_dim % DS4_BONSAI2_PQ2_BLOCK != 0) return 0;
+    if (!ds4_gpu_init()) return 0;
+    const uint32_t row_bytes = in_dim / DS4_BONSAI2_PQ2_BLOCK * DS4_BONSAI2_PQ2_BLOCK_BYTES;
+    const bonsai2_mm_args args = { in_dim, out_dim, n_tok, row_bytes };
+    bonsai2_bind b[3];
+    if (!bonsai2_bind_model(&b[0], model_map, model_size, weight_offset,
+                            (uint64_t)out_dim * row_bytes, "PQ2_0 weight") ||
+        !bonsai2_bind_tensor(&b[1], x, (uint64_t)n_tok * in_dim * (c.bh ? 2u : 4u), "matmul x") ||
+        !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "matmul out")) {
+        return 0;
+    }
+    return bonsai2_gemm_run(&c, &args, b);
+}
+
+/* Production prefill tile.  Auto (the default) picks per call between a
+ * narrow and a wide tile: the one with fewer padded token rows, weighted
+ * by the wide tile's per-row cost relative to the narrow one.  On M4 Pro
+ * 64x64_2x2 costs about 0.88x of 64x32_2x2 per padded token on every Bonsai
+ * projection shape, so the narrow tile wins only at 9-32 and 65-96 tokens.
+ * A forced tile (index into g_bonsai2_gemm_tiles) skips the rule. */
+static uint32_t g_bonsai2_gemm_tile = UINT32_MAX;   /* auto; see bonsai2_gemm_tile_for */
+static uint32_t g_bonsai2_gemm_auto_narrow = 0, g_bonsai2_gemm_auto_wide = 1;
+static double   g_bonsai2_gemm_auto_ratio = 0.88;
+static uint32_t g_bonsai2_gemm_pf = 0;
+
+static int bonsai2_tile_by_name(const char *s, uint32_t *tile) {
+    unsigned bm, bn, wm, wn;
+    if (sscanf(s, "%ux%u_%ux%u", &bm, &bn, &wm, &wn) != 4) return 0;
+    for (uint32_t i = 0; i < BONSAI2_GEMM_NTILE; i++) {
+        const uint16_t *t = g_bonsai2_gemm_tiles[i];
+        if (t[0] == bm && t[1] == bn && t[2] == wm && t[3] == wn) { *tile = i; return 1; }
+    }
+    return 0;
+}
+
+static uint32_t bonsai2_env_count(const char *name, uint32_t off_value, uint32_t *dst) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return 0;
+    *dst = strcmp(v, "off") == 0 ? off_value : (uint32_t)strtoul(v, NULL, 10);
+    return 1;
+}
+
+/* Tuning overrides for other chips (docs/BONSAI2_27B.md, "Tuning the
+ * prefill GEMM"), read once before the first prefill GEMM or setter call:
+ *   DS4_BONSAI2_GEMM_TILE      auto | BMxBN_WMxWN (one of g_bonsai2_gemm_tiles)
+ *   DS4_BONSAI2_GEMM_AUTO      NARROW,WIDE,RATIO for auto, e.g. 64x32_2x2,64x64_2x2,0.88
+ *   DS4_BONSAI2_GEMM_PREFETCH  0 | 1
+ *   DS4_BONSAI2_UNPACK_MIN     tokens from which weights are unpacked to F16, or off
+ *   DS4_BONSAI2_HALF_ACT_MIN   tokens from which GEMM inputs are half, or off
+ *   DS4_BONSAI2_UPSTREAM_MIN   tokens from which upstream's F16 GEMM runs (tensor ops on M5+), or off */
+static void bonsai2_gemm_env(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    int any = 0;
+    const char *v = getenv("DS4_BONSAI2_GEMM_TILE");
+    if (v && v[0]) {
+        any = 1;
+        if (strcmp(v, "auto") != 0 && !bonsai2_tile_by_name(v, &g_bonsai2_gemm_tile))
+            fprintf(stderr, "ds4: DS4_BONSAI2_GEMM_TILE=%s is not a known tile; using auto\n", v);
+    }
+    if ((v = getenv("DS4_BONSAI2_GEMM_AUTO")) && v[0]) {
+        any = 1;
+        char narrow[32] = "", wide[32] = "";
+        double ratio = 0.0;
+        uint32_t tn, tw;
+        if (sscanf(v, "%31[^,],%31[^,],%lf", narrow, wide, &ratio) == 3 && ratio > 0.0 &&
+            bonsai2_tile_by_name(narrow, &tn) && bonsai2_tile_by_name(wide, &tw)) {
+            g_bonsai2_gemm_auto_narrow = tn;
+            g_bonsai2_gemm_auto_wide = tw;
+            g_bonsai2_gemm_auto_ratio = ratio;
+        } else {
+            fprintf(stderr, "ds4: DS4_BONSAI2_GEMM_AUTO=%s is not NARROW,WIDE,RATIO; ignored\n", v);
+        }
+    }
+    if ((v = getenv("DS4_BONSAI2_GEMM_PREFETCH")) && v[0]) { any = 1; g_bonsai2_gemm_pf = atoi(v) != 0; }
+    any |= bonsai2_env_count("DS4_BONSAI2_UNPACK_MIN", 0u, &g_bonsai2_unpack_min_tok);
+    any |= bonsai2_env_count("DS4_BONSAI2_HALF_ACT_MIN", UINT32_MAX, &g_bonsai2_half_act_min_tok);
+    any |= bonsai2_env_count("DS4_BONSAI2_UPSTREAM_MIN", UINT32_MAX, &g_bonsai2_upstream_min_tok);
+    if (any) {
+        const uint16_t *n = g_bonsai2_gemm_tiles[g_bonsai2_gemm_auto_narrow];
+        const uint16_t *w = g_bonsai2_gemm_tiles[g_bonsai2_gemm_auto_wide];
+        char tile[32] = "auto";
+        if (g_bonsai2_gemm_tile != UINT32_MAX) {
+            const uint16_t *t = g_bonsai2_gemm_tiles[g_bonsai2_gemm_tile];
+            snprintf(tile, sizeof(tile), "%ux%u_%ux%u", t[0], t[1], t[2], t[3]);
+        }
+        fprintf(stderr, "ds4: bonsai2 prefill GEMM: tile %s (auto %ux%u_%ux%u / %ux%u_%ux%u at %.3f), "
+                "prefetch %u, unpack from %u, half activations from %u, upstream from %u (tensor ops %s)\n",
+                tile, n[0], n[1], n[2], n[3], w[0], w[1], w[2], w[3], g_bonsai2_gemm_auto_ratio,
+                g_bonsai2_gemm_pf, g_bonsai2_unpack_min_tok, g_bonsai2_half_act_min_tok,
+                g_bonsai2_upstream_min_tok, ds4_metal_tensor_ops_available() ? "on" : "off");
+    }
+}
+
+void ds4_gpu_bonsai2_set_gemm_tile(uint32_t tile, uint32_t prefetch) {
+    bonsai2_gemm_env();
+    g_bonsai2_gemm_tile = tile < BONSAI2_GEMM_NTILE ? tile : UINT32_MAX;
+    g_bonsai2_gemm_pf = prefetch != 0;
+}
+
+static uint32_t bonsai2_gemm_tile_for(uint32_t n_tok) {
+    bonsai2_gemm_env();
+    if (g_bonsai2_gemm_tile < BONSAI2_GEMM_NTILE) return g_bonsai2_gemm_tile;
+    const uint32_t bn = g_bonsai2_gemm_tiles[g_bonsai2_gemm_auto_narrow][1];
+    const uint32_t bw = g_bonsai2_gemm_tiles[g_bonsai2_gemm_auto_wide][1];
+    const uint32_t pad_n = (n_tok + bn - 1u) / bn * bn, pad_w = (n_tok + bw - 1u) / bw * bw;
+    return (double)pad_n < g_bonsai2_gemm_auto_ratio * (double)pad_w ? g_bonsai2_gemm_auto_narrow
+                                                                     : g_bonsai2_gemm_auto_wide;
+}
+
 int ds4_gpu_bonsai2_matmul_pq2_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
@@ -143,22 +359,25 @@ int ds4_gpu_bonsai2_matmul_pq2_tensor(
         !bonsai2_bind_tensor(&b[2], out, (uint64_t)n_tok * out_dim * sizeof(float), "matmul out")) {
         return 0;
     }
-    const uint64_t f16_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
-    if (n_tok > BONSAI2_MV_MAX_TOK && g_bonsai2_unpack_min_tok &&
-        n_tok >= g_bonsai2_unpack_min_tok && f16_bytes <= BONSAI2_UNPACK_MAX_BYTES) {
-        id<MTLBuffer> scratch = bonsai2_unpack_scratch(f16_bytes);
-        if (!scratch) return 0;
-        b[1] = (bonsai2_bind){ scratch, 0 };
-        const uint64_t n_words = (uint64_t)out_dim * (in_dim / 8);
-        return bonsai2_dispatch("kernel_bonsai2_unpack_pq2_f16", &args, sizeof(args), b, 2,
-                                MTLSizeMake((NSUInteger)((n_words + 255) / 256), 1, 1),
-                                MTLSizeMake(256, 1, 1), 0) &&
-               ds4_metal_matmul_f16_buffer(out, scratch, 0, in_dim, out_dim, x, n_tok);
-    }
     if (n_tok > BONSAI2_MV_MAX_TOK) {
-        return bonsai2_dispatch("kernel_bonsai2_mm_pq2", &args, sizeof(args), b, 3,
-                                MTLSizeMake((n_tok + 31) / 32, (out_dim + 63) / 64, 1),
-                                MTLSizeMake(128, 1, 1), 8192);
+        bonsai2_gemm_env();
+        const uint64_t f16_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+        if (bonsai2_use_upstream(n_tok) && f16_bytes <= BONSAI2_UNPACK_MAX_BYTES) {
+            id<MTLBuffer> scratch = bonsai2_unpack_scratch(f16_bytes);
+            if (!scratch) return 0;
+            bonsai2_bind ub[2] = { b[0], { scratch, 0 } };
+            const uint64_t n_words = (uint64_t)out_dim * (in_dim / 8);
+            return bonsai2_dispatch("kernel_bonsai2_unpack_pq2_f16", &args, sizeof(args), ub, 2,
+                                    MTLSizeMake((NSUInteger)((n_words + 255) / 256), 1, 1),
+                                    MTLSizeMake(256, 1, 1), 0) &&
+                   ds4_metal_matmul_f16_buffer(out, scratch, 0, in_dim, out_dim, x, n_tok);
+        }
+        const int unpack = g_bonsai2_unpack_min_tok && n_tok >= g_bonsai2_unpack_min_tok &&
+                           f16_bytes <= BONSAI2_UNPACK_MAX_BYTES;
+        const uint32_t v = (unpack ? 4u : 0u) + (bonsai2_act_half(n_tok) ? 2u : 0u) + g_bonsai2_gemm_pf;
+        bonsai2_gemm_cfg c;
+        if (!bonsai2_gemm_cfg_get(bonsai2_gemm_tile_for(n_tok) * 8u + v, &c)) return 0;
+        return bonsai2_gemm_run(&c, &args, b);
     }
     static const char *const names[BONSAI2_MV_MAX_TOK] = {
         "kernel_bonsai2_mv_pq2_1", "kernel_bonsai2_mv_pq2_2", "kernel_bonsai2_mv_pq2_3",
@@ -199,7 +418,7 @@ int ds4_gpu_bonsai2_rotate_tensor(
         return 0;
     }
     const uint64_t bytes = (uint64_t)n_tok * width * sizeof(float);
-    const bonsai2_rot_args args = { width, perm_hd, perm_nk, perm_rep, 0, 0.0f };
+    const bonsai2_rot_args args = { width, perm_hd, perm_nk, perm_rep, 0, 0.0f, (uint32_t)bonsai2_act_half(n_tok) };
     bonsai2_bind b[3];
     if (!bonsai2_bind_tensor(&b[0], x, bytes, "rotate x") ||
         !bonsai2_bind_tensor(&b[1], y, bytes, "rotate y") ||
@@ -214,7 +433,7 @@ int ds4_gpu_bonsai2_unrotate_tensor(
         ds4_gpu_tensor *x, const ds4_gpu_tensor *signs, uint32_t n_tok, uint32_t width) {
     if (n_tok == 0) return 1;
     if (!bonsai2_check_width(width, "unrotate")) return 0;
-    const bonsai2_rot_args args = { width, 0, 0, 0, 0, 0.0f };
+    const bonsai2_rot_args args = { width, 0, 0, 0, 0, 0.0f, 0 };
     bonsai2_bind b[2];
     if (!bonsai2_bind_tensor(&b[0], x, (uint64_t)n_tok * width * sizeof(float), "unrotate x") ||
         !bonsai2_bind_tensor(&b[1], signs, (uint64_t)width * sizeof(float), "unrotate signs")) {
@@ -231,7 +450,7 @@ int ds4_gpu_bonsai2_rms_rotate_tensor(
     if (n_tok == 0) return 1;
     if (!bonsai2_check_width(width, "rms rotate")) return 0;
     const uint64_t bytes = (uint64_t)n_tok * width * sizeof(float);
-    const bonsai2_rot_args args = { width, 0, 0, 0, xn != NULL, eps };
+    const bonsai2_rot_args args = { width, 0, 0, 0, xn != NULL, eps, (uint32_t)bonsai2_act_half(n_tok) };
     bonsai2_bind b[5];
     if (!bonsai2_bind_tensor(&b[0], x, bytes, "rms rotate x") ||
         !bonsai2_bind_tensor(&b[1], y, bytes, "rms rotate y") ||
@@ -279,7 +498,7 @@ int ds4_gpu_bonsai2_swiglu_rotate_tensor(
     if (n_tok == 0) return 1;
     if (!bonsai2_check_width(width, "swiglu rotate")) return 0;
     const uint64_t bytes = (uint64_t)n_tok * width * sizeof(float);
-    const bonsai2_rot_args args = { width, 0, 0, 0, 0, 0.0f };
+    const bonsai2_rot_args args = { width, 0, 0, 0, 0, 0.0f, (uint32_t)bonsai2_act_half(n_tok) };
     bonsai2_bind b[4];
     if (!bonsai2_bind_tensor(&b[0], gate, bytes, "swiglu gate") ||
         !bonsai2_bind_tensor(&b[1], up, bytes, "swiglu up") ||
@@ -303,7 +522,7 @@ int ds4_gpu_bonsai2_gdn_out_rotate_tensor(
         return 0;
     }
     const uint64_t bytes = (uint64_t)n_tok * width * sizeof(float);
-    const bonsai2_rot_args args = { width, head_dim, n_k_head, n_rep, 0, eps };
+    const bonsai2_rot_args args = { width, head_dim, n_k_head, n_rep, 0, eps, (uint32_t)bonsai2_act_half(n_tok) };
     bonsai2_bind b[5];
     if (!bonsai2_bind_tensor(&b[0], o, bytes, "gdn out o") ||
         !bonsai2_bind_tensor(&b[1], z, bytes, "gdn out z") ||
@@ -410,4 +629,24 @@ int ds4_gpu_bonsai2_attn_fa_tensor(
     return bonsai2_dispatch("kernel_bonsai2_attn_fa", &args, sizeof(args), b, 5,
                             MTLSizeMake(n_head_kv, (n_tok + tok_per_tg - 1) / tok_per_tg, 1),
                             MTLSizeMake(64u * BONSAI2_FA_NRT, 1, 1), 0);
+}
+
+double ds4_gpu_bonsai2_mma_peak(uint32_t iters, uint32_t n_tg, uint32_t nc) {
+    if (!ds4_gpu_init()) return 0;
+    id<MTLBuffer> buf = [ds4_metal_device() newBufferWithLength:(NSUInteger)n_tg * 4 * 256 * 16 options:MTLResourceStorageModePrivate];
+    bonsai2_bind b[1] = { { buf, 0 } };
+    const bonsai2_mm_args args = { iters, 0, 0, 0 };
+    double best = 1e30;
+    for (int r = 0; r < 4; r++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (!ds4_gpu_begin_commands() ||
+            !bonsai2_dispatch(nc == 16 ? "kernel_bonsai2_mma_peak16" : "kernel_bonsai2_mma_peak", &args, sizeof(args), b, 1,
+                              MTLSizeMake(n_tg, 1, 1), MTLSizeMake(128, 1, 1), 0) ||
+            !ds4_gpu_end_commands()) return 0;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        if (r && dt < best) best = dt;
+    }
+    return (double)n_tg * 4 * iters * nc * 1024 / best * 1e-12;
 }

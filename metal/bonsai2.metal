@@ -31,7 +31,14 @@ struct bonsai2_rot_args {
     uint  perm_rep;
     uint  write_xn;
     float eps;
+    uint  half_out;   /* y holds half (clamped to the fp16 range): prefill GEMM input */
 };
+
+/* Rotation output: float, or half exactly as the GEMMs round a float input. */
+static inline void bonsai2_put(device float *y, ulong i, float v, uint half_out) {
+    if (half_out) ((device half *)y)[i] = (half)clamp(v, -65504.0f, 65504.0f);
+    else y[i] = v;
+}
 
 /* ---------------------------------------------------------------------------
  * PQ2_0 matvec, NT = 1..8 activation rows.
@@ -188,120 +195,11 @@ template [[host_name("kernel_bonsai2_mv_pq2_7")]] kernel bonsai2_mv_pq2_t kernel
 template [[host_name("kernel_bonsai2_mv_pq2_8")]] kernel bonsai2_mv_pq2_t kernel_bonsai2_mv_pq2<8, 8, 4, 1>;
 
 /* ---------------------------------------------------------------------------
- * PQ2_0 GEMM for prefill: a 64 (weight rows) x 32 (tokens) output tile per
- * 128-thread threadgroup, K stepped 32 at a time.  Each step dequantizes a
- * 64x32 weight tile and a 32x32 activation tile to half in threadgroup
- * memory as 8x8 sub-tiles, then each simdgroup accumulates a 32x16 slice
- * with simdgroup_multiply_accumulate in float.  Ternary weights times an
- * fp16 scale are exact in half; only the activations round.
- * ------------------------------------------------------------------------- */
-kernel void kernel_bonsai2_mm_pq2(
-        constant bonsai2_mm_args &a [[buffer(0)]],
-        device const uchar       *w [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *y [[buffer(3)]],
-        threadgroup char     *shmem [[threadgroup(0)]],
-        uint2  tg  [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort sg  [[simdgroup_index_in_threadgroup]]) {
-    constexpr short NR0 = 64;
-    constexpr short NR1 = 32;
-    constexpr short NK  = 32;
-
-    threadgroup half *sa = (threadgroup half *)shmem;          /* NR0 x NK */
-    threadgroup half *sb = (threadgroup half *)(shmem + 4096); /* NR1 x NK */
-
-    const uint r0 = tg.y * NR0;
-    const uint r1 = tg.x * NR1;
-    const short nr0 = (short)min(a.out_dim - r0, (uint)NR0);
-    const short nr1 = (short)min(a.n_tok - r1, (uint)NR1);
-
-    /* Loader roles: two threads per weight row (16 k each), four per token
-     * row (8 k each).  Past-the-edge rows load a valid row; their results
-     * land outside the stored region. */
-    const short wrow = tid / 2;
-    const short wk = 16 * (tid % 2);
-    const short xrow = tid / 4;
-    const short xk = 8 * (tid % 4);
-
-    device const uchar *wp = w + (ulong)(r0 + min(wrow, (short)(nr0 - 1))) * a.row_bytes;
-    device const float *xp = x + (ulong)(r1 + min(xrow, (short)(nr1 - 1))) * a.in_dim + xk;
-
-    /* Threadgroup offsets of this thread's 16 weights and 8 activations.
-     * sa holds 8x8 tiles indexed (k/8)*8 + row/8, each stored k-major;
-     * sb holds tiles (k/8)*4 + tok/8, each stored token-major. */
-    threadgroup half *sa_dst = sa + 64 * (8 * (wk / 8) + wrow / 8) + wrow % 8;
-    threadgroup half *sb_dst = sb + 64 * (4 * (xk / 8) + xrow / 8) + 8 * (xrow % 8);
-
-    simdgroup_half8x8  ma[4];
-    simdgroup_half8x8  mb[2];
-    simdgroup_float8x8 mc[8];
-    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-
-    for (uint k = 0; k < a.in_dim; k += NK) {
-        const uint kw = k + wk;
-        device const uchar *blk = wp + (kw / BONSAI2_QK) * BONSAI2_QBYTES;
-        const half d = *(device const half *)blk;
-        device const ushort *qs = (device const ushort *)(blk + 2 + (kw % BONSAI2_QK) / 4);
-        const ushort q0 = qs[0];
-        const ushort q1 = qs[1];
-        const float4 x0 = *(device const float4 *)(xp + k);
-        const float4 x1 = *(device const float4 *)(xp + k + 4);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (short i = 0; i < 16; i++) {
-            const ushort q = i < 8 ? q0 : q1;
-            const half v = (half)((short)((q >> (2 * (i % 8))) & 3) - 1) * d;
-            sa_dst[64 * 8 * (i / 8) + 8 * (i % 8)] = v;
-        }
-        /* Clamp to the fp16 range: an outlier activation saturates instead of
-         * turning into inf and NaN-poisoning the residual and KV cache. */
-        *(threadgroup half4 *)(sb_dst)     = (half4)clamp(x0, -65504.0f, 65504.0f);
-        *(threadgroup half4 *)(sb_dst + 4) = (half4)clamp(x1, -65504.0f, 65504.0f);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        threadgroup const half *la = sa + 4 * 64 * (sg % 2);
-        threadgroup const half *lb = sb + 2 * 64 * (sg / 2);
-        for (short ik = 0; ik < NK / 8; ik++) {
-            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], la + 64 * i, 8, 0, false);
-            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lb + 64 * i, 8, 0, false);
-            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
-            la += 8 * 64;
-            lb += 4 * 64;
-        }
-    }
-
-    /* mc[i] is the 8x8 (token, row) tile at token 16*(sg/2) + 8*(i/4),
-     * row 32*(sg%2) + 8*(i%4) of this threadgroup's output tile. */
-    const uint orow = r0 + 32 * (sg % 2);
-    const uint otok = r1 + 16 * (sg / 2);
-    if (nr0 == NR0 && nr1 == NR1) {
-        device float *out = y + (ulong)otok * a.out_dim + orow;
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], out + 8 * (i % 4) + 8 * (ulong)a.out_dim * (i / 4), a.out_dim, 0, false);
-        }
-        return;
-    }
-
-    /* Edge tile: stage through threadgroup memory and store the valid part. */
-    threadgroup float *st = (threadgroup float *)shmem;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (short i = 0; i < 8; i++) {
-        simdgroup_store(mc[i], st + 32 * (sg % 2) + 8 * (i % 4) + NR0 * (16 * (sg / 2) + 8 * (i / 4)), NR0, 0, false);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (short e = tid; e < NR0 * NR1; e += 128) {
-        const short t = e / NR0;
-        const short o = e % NR0;
-        if (t < nr1 && o < nr0) y[(ulong)(r1 + t) * a.out_dim + r0 + o] = st[e];
-    }
-}
-
-/* ---------------------------------------------------------------------------
  * PQ2_0 -> F16 unpack for the prefill GEMM.  One thread expands one 16-bit
- * word (8 weights) into rows of in_dim halves, the layout upstream's
- * kernel_mul_mm_f16_f32 reads.  Values are (code - 1) * d computed in half,
- * the same exact values kernel_bonsai2_mm_pq2 stages.  Rows are whole
+ * word (8 weights) into rows of in_dim halves, the layout the F16-weight
+ * GEMM variants and upstream's kernel_mul_mm_f16_f32 read.  Values are
+ * (code - 1) * d computed in half, the same exact values the PQ2_0 variants
+ * stage.  Rows are whole
  * blocks, so the global block index walks the matrix contiguously.
  * ------------------------------------------------------------------------- */
 kernel void kernel_bonsai2_unpack_pq2_f16(
@@ -378,7 +276,7 @@ kernel void kernel_bonsai2_rotate(
         v[i] = x[row + src] * s[j];
     }
     bonsai2_fwht1024(v, sh, tid);
-    for (short i = 0; i < 4; i++) y[row + tg.x * BONSAI2_HB + i * 256 + tid] = v[i] * (1.0f / 32.0f);
+    for (short i = 0; i < 4; i++) bonsai2_put(y, row + tg.x * BONSAI2_HB + i * 256 + tid, v[i] * (1.0f / 32.0f), a.half_out);
 }
 
 /* x = s * H(z) in place for one (block, row). */
@@ -437,7 +335,7 @@ kernel void kernel_bonsai2_rms_rotate(
         v[i] = n * s[j];
     }
     bonsai2_fwht1024(v, sh, tid);
-    for (short i = 0; i < 4; i++) y[row + b + i * 256 + tid] = v[i] * (1.0f / 32.0f);
+    for (short i = 0; i < 4; i++) bonsai2_put(y, row + b + i * 256 + tid, v[i] * (1.0f / 32.0f), a.half_out);
 }
 
 /* Two BF16 projections of the same small batch (the GDN alpha and beta
@@ -497,7 +395,7 @@ kernel void kernel_bonsai2_swiglu_rotate(
         v[i] = g / (1.0f + exp(-g)) * up[base + j] * s[tg.x * BONSAI2_HB + j];
     }
     bonsai2_fwht1024(v, sh, tid);
-    for (short i = 0; i < 4; i++) y[base + i * 256 + tid] = v[i] * (1.0f / 32.0f);
+    for (short i = 0; i < 4; i++) bonsai2_put(y, base + i * 256 + tid, v[i] * (1.0f / 32.0f), a.half_out);
 }
 
 /* Gated DeltaNet output + rotate for one (block, row):
@@ -539,7 +437,7 @@ kernel void kernel_bonsai2_gdn_out_rotate(
                 (zv / (1.0f + exp(-zv))) * s[tg.x * BONSAI2_HB + i * 256 + tid];
     }
     bonsai2_fwht1024(v, sh, tid);
-    for (short i = 0; i < 4; i++) y[row + tg.x * BONSAI2_HB + i * 256 + tid] = v[i] * (1.0f / 32.0f);
+    for (short i = 0; i < 4; i++) bonsai2_put(y, row + tg.x * BONSAI2_HB + i * 256 + tid, v[i] * (1.0f / 32.0f), a.half_out);
 }
 
 /* Gated attention prep without the Qwen3.8 indexer: one simdgroup per
@@ -754,3 +652,203 @@ kernel void kernel_bonsai2_attn_fa(
         }
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * GEMM search family (prefill projections).  y[tok][out] = x[tok][:] . W[out][:]
+ * with a BM (weight rows) x BN (tokens) tile per threadgroup of WM x WN
+ * simdgroups, K in steps of 32 staged in threadgroup memory as 8x8 tiles
+ * (the kernel_mul_mm layout).  AQ: weights are PQ2_0 rows decoded while
+ * staging, else F16 rows [out][in].  BH: activations are F16, else F32
+ * (clamped to the fp16 range and rounded while staging).  PF: global loads
+ * for the next K step are issued before the current step's math.  Every
+ * variant multiplies the same half values in the same K order with float
+ * accumulators, so all of them and upstream's kernel_mul_mm_f16_f32 on the
+ * unpacked weight give bit-identical results.
+ * ------------------------------------------------------------------------- */
+struct bonsai2_u8 { half4 lo, hi; };
+
+template <short BM, short BN, short WM, short WN, bool AQ, bool BH, bool PF>
+kernel void kernel_bonsai2_gemm(
+        constant bonsai2_mm_args &a [[buffer(0)]],
+        device const uchar       *w [[buffer(1)]],
+        device const uchar       *x [[buffer(2)]],
+        device float             *y [[buffer(3)]],
+        threadgroup char     *shmem [[threadgroup(0)]],
+        uint2  tg   [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr short BK = 32, NT = 32 * WM * WN, TM = BM / WM / 8, TN = BN / WN / 8;
+    constexpr short AU = BM * 4, BU = BN * 4;              /* 8-wide K units per tile */
+    constexpr short AUT = (AU + NT - 1) / NT, BUT = (BU + NT - 1) / NT;
+    threadgroup half *sa = (threadgroup half *)shmem;      /* BM x BK */
+    threadgroup half *sb = sa + BM * BK;                   /* BN x BK */
+
+    const uint r0 = tg.y * BM, r1 = tg.x * BN;
+    const short nr0 = (short)min(a.out_dim - r0, (uint)BM);
+    const short nr1 = (short)min(a.n_tok - r1, (uint)BN);
+
+    bonsai2_u8 ra[AUT], rb[BUT];
+
+    auto load = [&](uint k) {
+        for (short u = 0; u < AUT; u++) {
+            const short unit = tid + u * NT;
+            if (AU % NT != 0 && unit >= AU) break;
+            const short row = min((short)(unit / 4), (short)(nr0 - 1)), g = unit % 4;
+            const uint kk = k + 8 * g;
+            if (AQ) {
+                device const uchar *blk = w + (ulong)(r0 + row) * a.row_bytes + (kk / BONSAI2_QK) * BONSAI2_QBYTES;
+                const half d = *(device const half *)blk;
+                const ushort q = *(device const ushort *)(blk + 2 + 2 * ((kk % BONSAI2_QK) / 8));
+                for (short i = 0; i < 4; i++) {
+                    ra[u].lo[i] = (half)((short)((q >> (2 * i)) & 3) - 1) * d;
+                    ra[u].hi[i] = (half)((short)((q >> (2 * (i + 4))) & 3) - 1) * d;
+                }
+            } else {
+                device const half4 *p = (device const half4 *)(w + ((ulong)(r0 + row) * a.in_dim + kk) * 2);
+                ra[u].lo = p[0];
+                ra[u].hi = p[1];
+            }
+        }
+        for (short u = 0; u < BUT; u++) {
+            const short unit = tid + u * NT;
+            if (BU % NT != 0 && unit >= BU) break;
+            const short tok = min((short)(unit / 4), (short)(nr1 - 1)), g = unit % 4;
+            const ulong e = (ulong)(r1 + tok) * a.in_dim + k + 8 * g;
+            if (BH) {
+                device const half4 *p = (device const half4 *)(x + e * 2);
+                rb[u].lo = p[0];
+                rb[u].hi = p[1];
+            } else {
+                device const float4 *p = (device const float4 *)(x + e * 4);
+                rb[u].lo = (half4)clamp(p[0], -65504.0f, 65504.0f);
+                rb[u].hi = (half4)clamp(p[1], -65504.0f, 65504.0f);
+            }
+        }
+    };
+    auto store = [&]() {
+        for (short u = 0; u < AUT; u++) {
+            const short unit = tid + u * NT;
+            if (AU % NT != 0 && unit >= AU) break;
+            const short row = unit / 4, g = unit % 4;
+            threadgroup half *dst = sa + 64 * (g * (BM / 8) + row / 8) + row % 8;
+            for (short i = 0; i < 4; i++) {
+                *(dst + 8 * i) = ra[u].lo[i];
+                *(dst + 8 * (i + 4)) = ra[u].hi[i];
+            }
+        }
+        for (short u = 0; u < BUT; u++) {
+            const short unit = tid + u * NT;
+            if (BU % NT != 0 && unit >= BU) break;
+            const short tok = unit / 4, g = unit % 4;
+            threadgroup half4 *dst = (threadgroup half4 *)(sb + 64 * (g * (BN / 8) + tok / 8) + 8 * (tok % 8));
+            dst[0] = rb[u].lo;
+            dst[1] = rb[u].hi;
+        }
+    };
+
+    const short sm = sg % WM, sn = sg / WM;
+    simdgroup_half8x8 ma[TM], mb[TN];
+    simdgroup_float8x8 mc[TM * TN];
+    for (short i = 0; i < TM * TN; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    if (PF) load(0);
+    for (uint k = 0; k < a.in_dim; k += BK) {
+        if (!PF) load(k);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        store();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (PF && k + BK < a.in_dim) load(k + BK);
+        threadgroup const half *la = sa + 64 * (sm * TM);
+        threadgroup const half *lb = sb + 64 * (sn * TN);
+        for (short ik = 0; ik < BK / 8; ik++) {
+            for (short i = 0; i < TM; i++) simdgroup_load(ma[i], la + 64 * i, 8, 0, false);
+            for (short j = 0; j < TN; j++) simdgroup_load(mb[j], lb + 64 * j, 8, 0, false);
+            for (short j = 0; j < TN; j++)
+                for (short i = 0; i < TM; i++)
+                    simdgroup_multiply_accumulate(mc[j * TM + i], mb[j], ma[i], mc[j * TM + i]);
+            la += 64 * (BM / 8);
+            lb += 64 * (BN / 8);
+        }
+    }
+
+    const uint orow = r0 + 8 * TM * sm, otok = r1 + 8 * TN * sn;
+    if (nr0 == BM && nr1 == BN) {
+        device float *out = y + (ulong)otok * a.out_dim + orow;
+        for (short j = 0; j < TN; j++)
+            for (short i = 0; i < TM; i++)
+                simdgroup_store(mc[j * TM + i], out + 8 * i + 8 * (ulong)a.out_dim * j, a.out_dim, 0, false);
+        return;
+    }
+    /* Edge tile: each 8x8 accumulator through this simdgroup's 64-float slot. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float *st = (threadgroup float *)shmem + 64 * sg;
+    for (short j = 0; j < TN; j++) {
+        for (short i = 0; i < TM; i++) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_store(mc[j * TM + i], st, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (short e = lane; e < 64; e += 32) {
+                const short t = 8 * TN * sn + 8 * j + e / 8, o = 8 * TM * sm + 8 * i + e % 8;
+                if (t < nr1 && o < nr0) y[(ulong)(r1 + t) * a.out_dim + r0 + o] = st[e];
+            }
+        }
+    }
+}
+
+#define BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, AQ_, BH_, PF_, NAME_) \
+template [[host_name("kernel_bonsai2_gemm_" #NAME_)]] \
+kernel void kernel_bonsai2_gemm<BM_, BN_, WM_, WN_, AQ_, BH_, PF_>(constant bonsai2_mm_args &, \
+        device const uchar *, device const uchar *, device float *, threadgroup char *, \
+        uint2, ushort, ushort, ushort);
+#define BONSAI2_GEMM_TILE(BM_, BN_, WM_, WN_) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, true,  false, false, BM_##x##BN_##_##WM_##x##WN_##_qfn) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, true,  false, true,  BM_##x##BN_##_##WM_##x##WN_##_qfp) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, true,  true,  false, BM_##x##BN_##_##WM_##x##WN_##_qhn) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, true,  true,  true,  BM_##x##BN_##_##WM_##x##WN_##_qhp) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, false, false, false, BM_##x##BN_##_##WM_##x##WN_##_ffn) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, false, false, true,  BM_##x##BN_##_##WM_##x##WN_##_ffp) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, false, true,  false, BM_##x##BN_##_##WM_##x##WN_##_fhn) \
+    BONSAI2_GEMM_INST(BM_, BN_, WM_, WN_, false, true,  true,  BM_##x##BN_##_##WM_##x##WN_##_fhp)
+BONSAI2_GEMM_TILE(64, 32, 2, 2)
+BONSAI2_GEMM_TILE(64, 64, 2, 2)
+BONSAI2_GEMM_TILE(64, 64, 2, 4)
+BONSAI2_GEMM_TILE(128, 32, 4, 2)
+BONSAI2_GEMM_TILE(128, 64, 4, 2)
+BONSAI2_GEMM_TILE(64, 128, 2, 4)
+BONSAI2_GEMM_TILE(128, 64, 4, 4)
+BONSAI2_GEMM_TILE(128, 128, 4, 4)
+BONSAI2_GEMM_TILE(32, 64, 1, 2)
+
+/* Simdgroup MMA peak probe (tests/bonsai2/test_kernels --mma-peak): the
+ * ceiling the prefill GEMMs can reach on this GPU.  Per simdgroup, each
+ * iteration rewrites one element of its A tile, reloads A and runs NC
+ * independent MMAs against NC different B tiles; every chain is stored, so
+ * the compiler can neither hoist a product nor drop a chain. */
+template <short NC>
+kernel void kernel_bonsai2_mma_peak(
+        constant bonsai2_mm_args &a [[buffer(0)]],
+        device float *y [[buffer(1)]],
+        uint tg [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half T[4][64];
+    threadgroup half U[16 * 64];
+    for (short i = lane; i < 64; i += 32) T[sg][i] = (half)(0.001f * (float)((i * 7 + tg) % 13));
+    for (short i = tid; i < 16 * 64; i += 128) U[i] = (half)(0.002f * (float)((i * 3 + 1) % 11));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 A, B[NC];
+    for (short i = 0; i < NC; i++) simdgroup_load(B[i], U + 64 * i, 8, 0, false);
+    simdgroup_float8x8 C[NC];
+    for (short i = 0; i < NC; i++) C[i] = make_filled_simdgroup_matrix<float, 8>((float)i);
+    for (uint it = 0; it < a.in_dim; it++) {
+        if (lane == 0) T[sg][it & 63] = (half)(float)(it & 7);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(A, T[sg], 8, 0, false);
+        for (short i = 0; i < NC; i++) simdgroup_multiply_accumulate(C[i], A, B[i], C[i]);
+    }
+    for (short i = 0; i < NC; i++) simdgroup_store(C[i], y + ((tg * 4 + sg) * NC + i) * 64, 8, 0, false);
+}
+template [[host_name("kernel_bonsai2_mma_peak")]] kernel void kernel_bonsai2_mma_peak<8>(constant bonsai2_mm_args &, device float *, uint, ushort, ushort, ushort);
+template [[host_name("kernel_bonsai2_mma_peak16")]] kernel void kernel_bonsai2_mma_peak<16>(constant bonsai2_mm_args &, device float *, uint, ushort, ushort, ushort);

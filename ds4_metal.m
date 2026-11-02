@@ -50570,6 +50570,7 @@ id<MTLBuffer> ds4_metal_wrap_model_range(const void *map, uint64_t size, uint64_
     return ds4_gpu_wrap_model_range(map, size, off, len, inner);
 }
 __attribute__((weak)) NSArray<NSArray<NSString *> *> *ds4_metal_fork_sources(void) { return nil; }
+int ds4_metal_tensor_ops_available(void) { return ds4_gpu_mpp_available(); }
 /* The n_tok > 8 GEMM of ds4_gpu_matmul_f16_tensor_impl on an F16 weight that
  * already lives in a GPU buffer (rows of in_dim halves) instead of the model
  * map.  Joins the open batch like every wrapper. */

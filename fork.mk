@@ -24,12 +24,22 @@ tests/bonsai2/test_kernels: tests/bonsai2/test_kernels.o ds4_metal.o ds4_metal_b
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 # Kernel unit tests against CPU references (no model needed).
-.PHONY: test-bonsai2-kernels bench-bonsai2-kernels test-bonsai2-reference
+.PHONY: test-bonsai2-kernels bench-bonsai2-kernels tune-bonsai2-gemm test-bonsai2-reference
 test-bonsai2-kernels: tests/bonsai2/test_kernels
 	./tests/bonsai2/test_kernels
+	./tests/bonsai2/test_kernels --gemm-check
 
 bench-bonsai2-kernels: tests/bonsai2/test_kernels
 	./tests/bonsai2/test_kernels --bench
+
+# Prefill GEMM grid for tuning on another chip (docs/BONSAI2_27B.md):
+# every configuration on Bonsai's projection shapes, ranked by whole-model
+# GEMM time.  GEMM_TOKENS / GEMM_FILTER narrow the grid.
+GEMM_TOKENS ?= 16,64,96,256,512,1024,2048,4096
+tune-bonsai2-gemm: tests/bonsai2/test_kernels
+	./tests/bonsai2/test_kernels --gemm-check
+	./tests/bonsai2/test_kernels --bench-gemm "$(GEMM_FILTER)" $(GEMM_TOKENS) 2>/dev/null > bonsai2-gemm.csv
+	./tests/bonsai2/gemm_rank.py bonsai2-gemm.csv
 
 # End-to-end greedy/logprob match against the PrismML reference (needs the
 # model; BONSAI2_MODEL overrides the default gguf/ path).

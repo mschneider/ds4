@@ -6,7 +6,10 @@
  *   make test-bonsai2-kernels                 correctness
  *   make bench-bonsai2-kernels                decode/prefill throughput
  *   tests/bonsai2/test_kernels --bench-decode  matvec only
- *   tests/bonsai2/test_kernels --bench-attn    prefill attention only */
+ *   tests/bonsai2/test_kernels --bench-attn    prefill attention only
+ *   tests/bonsai2/test_kernels --gemm-check    every GEMM configuration bit-exact
+ *   tests/bonsai2/test_kernels --bench-gemm [FILTER] [TOKENS]  GEMM grid as CSV
+ *   tests/bonsai2/test_kernels --mma-peak      simdgroup MMA ceiling of this GPU */
 
 #include <math.h>
 #include <stdbool.h>
@@ -716,6 +719,46 @@ static void test_attn_fa(uint32_t n_tok, uint32_t pos0) {
     ds4_gpu_tensor_free(tv); ds4_gpu_tensor_free(to); ds4_gpu_tensor_free(tr);
 }
 
+/* Half activations: each rotation feeding a prefill GEMM, then the GEMM,
+ * with half outputs on and off must give bit-identical GEMM results. */
+static void test_half_chain(uint32_t n_tok) {
+    const uint32_t E = 5120, F = 17408, Q = 6144;
+    float *x = rand_floats((uint64_t)n_tok * F, -3.0f, 3.0f);
+    float *x2 = rand_floats((uint64_t)n_tok * F, -3.0f, 3.0f);
+    float *wn = rand_floats(F, 0.5f, 1.5f);
+    float *sE = rand_signs(E), *sF = rand_signs(F), *sQ = rand_signs(Q);
+    const uint64_t wn_off = map_floats(wn, F);
+    const uint64_t wE = map_pq2(E, 256), wF = map_pq2(F, 256), wQ = map_pq2(Q, 256);
+    ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * F * 4), *tx2 = upload(x2, (uint64_t)n_tok * F * 4);
+    ds4_gpu_tensor *tsE = upload(sE, E * 4), *tsF = upload(sF, F * 4), *tsQ = upload(sQ, Q * 4);
+    ds4_gpu_tensor *tr = upload(NULL, (uint64_t)n_tok * F * 4), *ty = upload(NULL, (uint64_t)n_tok * 256 * 4);
+    const char *names[4] = { "rms_rotate", "swiglu_rotate", "gdn_out_rotate", "rotate" };
+    for (int k = 0; k < 4; k++) {
+        const uint32_t in = k == 0 ? E : k == 1 ? F : Q;
+        const uint64_t wo = k == 0 ? wE : k == 1 ? wF : wQ;
+        float *res[2];
+        for (int h = 0; h < 2; h++) {
+            ds4_gpu_bonsai2_set_half_act_min_tokens(h ? 9 : UINT32_MAX);
+            int ok = 0;
+            if (k == 0) ok = ds4_gpu_bonsai2_rms_rotate_tensor(tr, NULL, tx, g_map, g_map_size, wn_off, tsE, n_tok, E, 1e-6f);
+            if (k == 1) ok = ds4_gpu_bonsai2_swiglu_rotate_tensor(tr, tx, tx2, tsF, n_tok, F);
+            if (k == 2) ok = ds4_gpu_bonsai2_gdn_out_rotate_tensor(tr, tx, tx2, g_map, g_map_size, wn_off, tsQ, n_tok, 128, 16, 3, 1e-6f);
+            if (k == 3) ok = ds4_gpu_bonsai2_rotate_tensor(tr, tx, tsQ, n_tok, Q, 0, 0, 0);
+            require_ok(ok, names[k]);
+            require_ok(ds4_gpu_bonsai2_matmul_pq2_tensor(ty, g_map, g_map_size, wo, in, 256, tr, n_tok), "half chain matmul");
+            res[h] = download(ty, (uint64_t)n_tok * 256);
+        }
+        char what[96];
+        snprintf(what, sizeof(what), "half activations %-14s n_tok %4u", names[k], n_tok);
+        report(what, memcmp(res[0], res[1], (size_t)n_tok * 256 * 4) != 0, 0.0);
+        free(res[0]); free(res[1]);
+    }
+    ds4_gpu_bonsai2_set_half_act_min_tokens(UINT32_MAX);
+    free(x); free(x2); free(wn); free(sE); free(sF); free(sQ);
+    ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tx2); ds4_gpu_tensor_free(tsE); ds4_gpu_tensor_free(tsF);
+    ds4_gpu_tensor_free(tsQ); ds4_gpu_tensor_free(tr); ds4_gpu_tensor_free(ty);
+}
+
 /* ---- benchmark --------------------------------------------------------- */
 
 static double now_s(void) {
@@ -788,9 +831,176 @@ static void bench_attn(uint32_t n_tok, int flash, int iters) {
     ds4_gpu_tensor_free(tv); ds4_gpu_tensor_free(to);
 }
 
+/* ---- GEMM search ------------------------------------------------------- */
+
+static _Float16 *to_half(const float *x, uint64_t n) {
+    _Float16 *h = malloc(n * sizeof(_Float16));
+    require_ok(h != NULL, "host allocation");
+    for (uint64_t i = 0; i < n; i++) {
+        const float v = x[i] > 65504.0f ? 65504.0f : x[i] < -65504.0f ? -65504.0f : x[i];
+        h[i] = (_Float16)v;
+    }
+    return h;
+}
+
+/* Every configuration must reproduce the production GEMM bit for bit
+ * (same half products, same K order, float accumulation). */
+static void test_gemm_cfgs(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    const uint64_t w_off = map_pq2(in_dim, out_dim);
+    float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
+    _Float16 *xh = to_half(x, (uint64_t)n_tok * in_dim);
+    ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
+    ds4_gpu_tensor *th = upload(xh, (uint64_t)n_tok * in_dim * sizeof(_Float16));
+    ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
+    ds4_gpu_bonsai2_set_unpack_min_tokens(0);
+    require_ok(ds4_gpu_bonsai2_matmul_pq2_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim, tx, n_tok),
+               "bonsai2 matmul");
+    float *ref = download(ty, (uint64_t)n_tok * out_dim);
+    int bad = 0;
+    for (uint32_t c = 0; c < ds4_gpu_bonsai2_gemm_cfg_count(); c++) {
+        int hx = 0;
+        const char *name = ds4_gpu_bonsai2_gemm_cfg_name(c, &hx);
+        require_ok(ds4_gpu_bonsai2_matmul_cfg_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim,
+                                                     hx ? th : tx, n_tok, c), name);
+        float *y = download(ty, (uint64_t)n_tok * out_dim);
+        uint64_t diff = 0;
+        for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) diff += memcmp(&y[i], &ref[i], 4) != 0;
+        if (diff) { printf("  gemm %-22s %5u -> %5u n_tok %4u: %llu values differ FAIL\n", name, in_dim, out_dim,
+                           n_tok, (unsigned long long)diff); bad = 1; }
+        free(y);
+    }
+    /* DS4_BONSAI2_UPSTREAM_MIN: unpack plus upstream's F16 GEMM. */
+    ds4_gpu_bonsai2_set_upstream_min_tokens(9);
+    require_ok(ds4_gpu_bonsai2_matmul_pq2_tensor(ty, g_map, g_map_size, w_off, in_dim, out_dim, tx, n_tok),
+               "upstream gemm");
+    ds4_gpu_bonsai2_set_upstream_min_tokens(UINT32_MAX);
+    {
+        float *y = download(ty, (uint64_t)n_tok * out_dim);
+        if (memcmp(y, ref, (size_t)n_tok * out_dim * 4) != 0) {
+            printf("  gemm upstream %5u -> %5u n_tok %4u differs FAIL\n", in_dim, out_dim, n_tok);
+            bad = 1;
+        }
+        free(y);
+    }
+    char what[96];
+    snprintf(what, sizeof(what), "gemm cfgs %5u -> %5u n_tok %4u bit-identical", in_dim, out_dim, n_tok);
+    report(what, bad, 0.0);
+    free(x); free(xh); free(ref);
+    ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(th); ds4_gpu_tensor_free(ty);
+}
+
+/* One shape at one token count: production path (cfg UINT32_MAX) or a
+ * configuration; weights cycle through enough copies to defeat the SLC. */
+static double time_gemm(uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, uint32_t cfg,
+                        const uint64_t *offs, uint32_t copies, ds4_gpu_tensor *tx, ds4_gpu_tensor *th,
+                        ds4_gpu_tensor *ty, int iters) {
+    int hx = 0;
+    if (cfg != UINT32_MAX) ds4_gpu_bonsai2_gemm_cfg_name(cfg, &hx);
+    double best = 1e30;
+    for (int rep = 0; rep < 3; rep++) {
+        require_ok(ds4_gpu_begin_commands(), "begin commands");
+        const double t0 = now_s();
+        for (int i = 0; i < iters; i++) {
+            const uint64_t off = offs[i % copies];
+            require_ok(cfg == UINT32_MAX
+                       ? ds4_gpu_bonsai2_matmul_pq2_tensor(ty, g_map, g_map_size, off, in_dim, out_dim, tx, n_tok)
+                       : ds4_gpu_bonsai2_matmul_cfg_tensor(ty, g_map, g_map_size, off, in_dim, out_dim,
+                                                           hx ? th : tx, n_tok, cfg), "bench gemm");
+        }
+        require_ok(ds4_gpu_end_commands(), "end commands");
+        const double dt = (now_s() - t0) / iters;
+        if (rep > 0 && dt < best) best = dt;
+    }
+    return best;
+}
+
+/* CSV: shape,in,out,n_tok,cfg,ms,tflops.  filter (optional) keeps only
+ * configurations whose name contains it. */
+static void bench_gemm(const char *filter, const char *tok_list) {
+    static const struct { const char *name; uint32_t in, out; } shapes[] = {
+        {"ffn_gate_up", 5120, 17408}, {"ffn_down", 17408, 5120}, {"lin_qkv", 5120, 10240},
+        {"lin_z", 5120, 6144}, {"out_6144", 6144, 5120}, {"attn_q", 5120, 12288}, {"attn_kv", 5120, 1024},
+    };
+    uint32_t toks[8], nt = 0;
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s", tok_list ? tok_list : "512,2048,4096");
+        for (char *t = strtok(buf, ","); t && nt < 8; t = strtok(NULL, ",")) toks[nt++] = (uint32_t)atoi(t);
+    }
+    printf("shape,in,out,n_tok,cfg,ms,tflops\n");
+    for (uint32_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const uint32_t in_dim = shapes[si].in, out_dim = shapes[si].out;
+        const uint64_t wbytes = (uint64_t)out_dim * (in_dim / QK) * QB;
+        uint32_t copies = (uint32_t)((512ull << 20) / wbytes) + 1;
+        if (copies > 16) copies = 16;
+        uint64_t offs[16];
+        g_map_used = 0;
+        for (uint32_t c = 0; c < copies; c++) offs[c] = map_pq2(in_dim, out_dim);
+        for (uint32_t ti = 0; ti < nt; ti++) {
+            const uint32_t n_tok = toks[ti];
+            float *x = rand_floats((uint64_t)n_tok * in_dim, -1.0f, 1.0f);
+            _Float16 *xh = to_half(x, (uint64_t)n_tok * in_dim);
+            ds4_gpu_tensor *tx = upload(x, (uint64_t)n_tok * in_dim * sizeof(float));
+            ds4_gpu_tensor *th = upload(xh, (uint64_t)n_tok * in_dim * sizeof(_Float16));
+            ds4_gpu_tensor *ty = upload(NULL, (uint64_t)n_tok * out_dim * sizeof(float));
+            const double flop = 2.0 * in_dim * out_dim * n_tok;
+            const int iters = flop > 4e11 ? 2 : flop > 5e10 ? 4 : 8;
+            ds4_gpu_bonsai2_set_unpack_min_tokens(0);
+            double t = time_gemm(in_dim, out_dim, n_tok, UINT32_MAX, offs, copies, tx, th, ty, iters);
+            printf("%s,%u,%u,%u,prod_fused,%.3f,%.3f\n", shapes[si].name, in_dim, out_dim, n_tok, t * 1e3, flop / t * 1e-12);
+            ds4_gpu_bonsai2_set_unpack_min_tokens(1);
+            t = time_gemm(in_dim, out_dim, n_tok, UINT32_MAX, offs, copies, tx, th, ty, iters);
+            printf("%s,%u,%u,%u,prod_unpack,%.3f,%.3f\n", shapes[si].name, in_dim, out_dim, n_tok, t * 1e3, flop / t * 1e-12);
+            ds4_gpu_bonsai2_set_upstream_min_tokens(9);
+            t = time_gemm(in_dim, out_dim, n_tok, UINT32_MAX, offs, copies, tx, th, ty, iters);
+            printf("%s,%u,%u,%u,prod_upstream,%.3f,%.3f\n", shapes[si].name, in_dim, out_dim, n_tok, t * 1e3, flop / t * 1e-12);
+            ds4_gpu_bonsai2_set_upstream_min_tokens(UINT32_MAX);
+            ds4_gpu_bonsai2_set_unpack_min_tokens(2048);
+            for (uint32_t c = 0; c < ds4_gpu_bonsai2_gemm_cfg_count(); c++) {
+                const char *name = ds4_gpu_bonsai2_gemm_cfg_name(c, NULL);
+                if (filter && !strstr(name, filter)) continue;
+                t = time_gemm(in_dim, out_dim, n_tok, c, offs, copies, tx, th, ty, iters);
+                printf("%s,%u,%u,%u,%s,%.3f,%.3f\n", shapes[si].name, in_dim, out_dim, n_tok, name, t * 1e3, flop / t * 1e-12);
+                fflush(stdout);
+            }
+            free(x); free(xh);
+            ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(th); ds4_gpu_tensor_free(ty);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     const int decode_only = argc > 1 && strcmp(argv[1], "--bench-decode") == 0;
     const int attn_only = argc > 1 && strcmp(argv[1], "--bench-attn") == 0;
+    if (argc > 1 && strcmp(argv[1], "--bench-gemm") == 0) {
+        require_ok(ds4_gpu_init(), "GPU initialization");
+        map_create(1100ull << 20);
+        g_rng = 0xb0d5a12ull;
+        require_ok(ds4_gpu_set_model_map(g_map, g_map_size), "model map registration");
+        ds4_gpu_bonsai2_set_half_act_min_tokens(UINT32_MAX);   /* production baselines read float x */
+        bench_gemm(argc > 2 && argv[2][0] ? argv[2] : NULL, argc > 3 ? argv[3] : NULL);
+        ds4_gpu_cleanup();
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--mma-peak") == 0) {
+        for (uint32_t nc = 8; nc <= 16; nc += 8) for (uint32_t n = 256; n <= 4096; n *= 4) printf("mma peak chains %u tg %u: %.2f TFLOPS\n", nc, n, ds4_gpu_bonsai2_mma_peak(20000, n, nc));
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--gemm-check") == 0) {
+        require_ok(ds4_gpu_init(), "GPU initialization");
+        map_create(512ull << 20);
+        g_rng = 0xb0d5a12ull;
+        require_ok(ds4_gpu_set_model_map(g_map, g_map_size), "model map registration");
+        ds4_gpu_bonsai2_set_half_act_min_tokens(UINT32_MAX);   /* the reference reads float x */
+        test_gemm_cfgs(5120, 248, 9);
+        test_gemm_cfgs(5120, 248, 333);
+        test_gemm_cfgs(6144, 5120, 64);
+        test_gemm_cfgs(6144, 5120, 100);
+        test_gemm_cfgs(17408, 1024, 517);
+        ds4_gpu_cleanup();
+        printf(g_failed ? "gemm check: FAILED\n" : "gemm check: all configurations bit-identical\n");
+        return g_failed;
+    }
     const int bench = decode_only || attn_only || (argc > 1 && strcmp(argv[1], "--bench") == 0);
     require_ok(ds4_gpu_init(), "GPU initialization");
     map_create(bench ? (1100ull << 20) : (512ull << 20));
@@ -832,6 +1042,7 @@ int main(int argc, char **argv) {
     }
     require_ok(ds4_gpu_set_model_map(g_map, g_map_size), "model map registration");
 
+    ds4_gpu_bonsai2_set_half_act_min_tokens(UINT32_MAX);   /* the tests below feed float GEMM inputs */
     printf("bonsai2 kernels:\n");
     const uint32_t all[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 64, 333 };
     const uint32_t some[] = { 1, 4, 8, 64, 333 };
@@ -866,6 +1077,9 @@ int main(int argc, char **argv) {
     test_attn_prep(1);
     test_attn_prep(7);
     test_attn_prep(40);
+    test_half_chain(9);
+    test_half_chain(100);
+    test_half_chain(600);
     test_attn_fa(9, 0);
     test_attn_fa(10, 3);
     test_attn_fa(17, 37);

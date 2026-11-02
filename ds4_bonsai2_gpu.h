@@ -43,6 +43,25 @@ int ds4_gpu_bonsai2_matmul_pq2_tensor(
  * buffer and runs upstream's F16 GEMM instead of the fused PQ2_0 GEMM.  0
  * disables the unpack path.  Default 512; for benchmarks and tests. */
 void ds4_gpu_bonsai2_set_unpack_min_tokens(uint32_t n_tok);
+
+/* From n_tok rows on (and above the matvec range), the rotation kernels
+ * write their outputs as half and the prefill GEMM reads half; UINT32_MAX
+ * keeps float.  Only the prefill GEMMs read those buffers, and the half
+ * values are exactly what the GEMM would round a float input to. */
+void ds4_gpu_bonsai2_set_half_act_min_tokens(uint32_t n_tok);
+
+/* Prefill GEMM tile (index into the tile table of ds4_metal_bonsai2.m;
+ * anything past it restores auto) and whether it prefetches the next K step. */
+void ds4_gpu_bonsai2_set_gemm_tile(uint32_t tile, uint32_t prefetch);
+
+/* From n_tok rows on, unpack to F16 and run upstream's F16 GEMM (Metal 4
+ * tensor ops on M5 and later); UINT32_MAX (the default) never does. */
+void ds4_gpu_bonsai2_set_upstream_min_tokens(uint32_t n_tok);
+
+/* Simdgroup half MMA throughput in TFLOPS: n_tg threadgroups of 4
+ * simdgroups, each running iters x nc (8 or 16) 8x8x8 MMAs.  Best of three
+ * timed runs. */
+double ds4_gpu_bonsai2_mma_peak(uint32_t iters, uint32_t n_tg, uint32_t nc);
 /* Frees the unpack scratch buffer. */
 void ds4_gpu_bonsai2_release(void);
 
@@ -125,6 +144,17 @@ int ds4_gpu_bonsai2_attn_fa_tensor(
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
         uint32_t pos0, uint32_t cache_cap, float scale);
+
+/* GEMM search (tests/bonsai2/test_kernels --bench-gemm): configuration i of
+ * kernel_bonsai2_gemm, NULL past the end; *half_x says it reads F16
+ * activations.  The matmul runs that configuration, unpacking the PQ2_0
+ * weight to F16 first when the configuration reads F16 weights. */
+uint32_t ds4_gpu_bonsai2_gemm_cfg_count(void);
+const char *ds4_gpu_bonsai2_gemm_cfg_name(uint32_t i, int *half_x);
+int ds4_gpu_bonsai2_matmul_cfg_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok, uint32_t cfg);
 
 #ifdef __cplusplus
 }
