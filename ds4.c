@@ -60152,19 +60152,23 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
     double prof[6] = {0};
     const bool prof_on = timing == 2;
     double prof_last = prof_on ? now_sec() : 0.0;
-    /* Single-token steps also sum GPU execution time per stage (fork). */
-    static double prof_gpu[6], prof_wall[6];
-    static uint32_t prof_tokens;
-    if (prof_on) (void)ds4_gpu_take_gpu_span_ms();
+    /* Decode and MTP verification steps (T <= 3) also sum GPU execution time
+     * per stage, per step size (fork): the six stages, the output head (6)
+     * and GPU work between steps, such as MTP drafting (7). */
+    static double prof_gpu[4][8], prof_wall[4];
+    static uint32_t prof_steps[4], prof_all_steps;
+    static double prof_prev_end;
+    const uint32_t prof_t = T <= 3u ? T : 0u;
+    if (prof_on) {
+        const double outside = ds4_gpu_take_gpu_span_ms();
+        if (prof_t) prof_gpu[prof_t][7] += outside;
+    }
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
             ds4_gpu_end_commands(); \
             const double now_ = now_sec(); \
             prof[idx_] += now_ - prof_last; \
-            if (T == 1u) { \
-                prof_wall[idx_] += 1e3 * (now_ - prof_last); \
-                prof_gpu[idx_] += ds4_gpu_take_gpu_span_ms(); \
-            } \
+            if (prof_t) prof_gpu[prof_t][idx_] += ds4_gpu_take_gpu_span_ms(); \
             prof_last = now_; \
             glm_graph_begin_commands_if_needed(); \
         } \
@@ -60228,16 +60232,7 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
          * end_commands below waits for both batches before inputs are reused. */
         if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
-    if (prof_on && T == 1u && ++prof_tokens % 32u == 0u) {
-        fprintf(stderr, "ds4: Qwen3.8 decode stage ms/token, GPU (wall): ple %.2f (%.2f) hc_attn %.2f (%.2f) "
-                "gdn %.2f (%.2f) attn %.2f (%.2f) hc_ffn %.2f (%.2f) moe %.2f (%.2f)\n",
-                prof_gpu[0] / 32, prof_wall[0] / 32, prof_gpu[1] / 32, prof_wall[1] / 32,
-                prof_gpu[2] / 32, prof_wall[2] / 32, prof_gpu[3] / 32, prof_wall[3] / 32,
-                prof_gpu[4] / 32, prof_wall[4] / 32, prof_gpu[5] / 32, prof_wall[5] / 32);
-        memset(prof_gpu, 0, sizeof(prof_gpu));
-        memset(prof_wall, 0, sizeof(prof_wall));
-    }
-    if (prof_on && T > 1u) {
+    if (prof_on && T > 3u) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
                 "ple %.1f hc_attn %.1f gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n",
                 pos0, T, ok ? 1 : 0, 1000.0 * prof[0], 1000.0 * prof[1],
@@ -60272,6 +60267,30 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
+    if (prof_on && prof_t) {
+        prof_gpu[prof_t][6] += ds4_gpu_take_gpu_span_ms();
+        if (prof_prev_end > 0.0) {
+            prof_wall[prof_t] += 1e3 * (t3 - prof_prev_end);
+            prof_steps[prof_t]++;
+        }
+        prof_prev_end = t3;
+        if (++prof_all_steps % 64u == 0u) {
+            for (uint32_t t = 1; t <= 3u; t++) {
+                const double n = prof_steps[t];
+                if (!n) continue;  /* GPU sums include the first step; ignored */
+                const double *q = prof_gpu[t];
+                double sum = 0.0;
+                for (int i = 0; i < 8; i++) sum += q[i];
+                fprintf(stderr, "ds4: Qwen3.8 T=%u steps=%u GPU ms/step: ple %.2f hc_attn %.2f gdn %.2f "
+                        "attn %.2f hc_ffn %.2f moe %.2f head %.2f between %.2f = %.2f; wall %.2f\n",
+                        t, prof_steps[t], q[0] / n, q[1] / n, q[2] / n, q[3] / n, q[4] / n, q[5] / n,
+                        q[6] / n, q[7] / n, sum / n, prof_wall[t] / n);
+            }
+            memset(prof_gpu, 0, sizeof(prof_gpu));
+            memset(prof_wall, 0, sizeof(prof_wall));
+            memset(prof_steps, 0, sizeof(prof_steps));
+        }
+    }
     if (ok && logits_out) {
         const uint64_t rows = all_rows ? T : 1u;
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, rows * DS4_N_VOCAB * sizeof(float)) != 0;
