@@ -298,8 +298,10 @@ from 0.21 ms CPU encode + 1.13 ms drain wait per layer to 0.11 + 0.82 ms,
 about 18 ms less per token. About 0.25 ms per layer is still the drain's
 launch and wake-up latency.
 
-`DS4_QWEN4_STREAM_HANDSHAKE=1` (`ds4_metal_stream_handshake.inc`, off by
-default) removes that drain for single-token decode: the router's ids are
+The decode handshake (`ds4_metal_stream_handshake.inc`) removes that drain
+for single-token decode. It is on by default when MTP is off;
+`DS4_QWEN4_STREAM_HANDSHAKE=0` turns it off and `=1` also uses it with
+`--mtp` (for single-token steps only, which measured no faster): the router's ids are
 copied to shared words at the end of a command buffer, the next command
 buffer starts with a wait for a shared event, and the experts run through
 the layer's expert address table. The CPU encodes the next layer, then spins
@@ -317,7 +319,7 @@ Interleaved on the M4 Pro (Q2, AC power, powermode 2; tok/s):
 | --- | ---: | ---: | ---: | ---: |
 | early commit off | 16.0-17.0 | 19.0-19.2 | | |
 | early commit (default) | 17.4-17.7 | 19.5-20.0 | 18.0, 18.2 | 17.1, 19.8 |
-| early commit + handshake | 19.0-19.4 | 21.9-22.1 | 19.0, 19.2 | 15.2, 19.1 |
+| early commit + handshake (default without MTP) | 19.0-19.4 | 21.9-22.1 | 19.0, 19.2 | 15.2, 19.1 |
 
 ds4-bench: 4K-token `promessi_sposi.txt` prompt, 128 tokens, 256K allocation,
 three rounds. CLI: warm 4K-token prompt, 256 tokens, `--ctx 32768`, two

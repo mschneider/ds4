@@ -2,7 +2,7 @@
  *
  * The ordinary streamed MoE drains the GPU at every layer so the CPU can
  * read the router's expert ids, load the missing experts and bind them.
- * With DS4_QWEN4_STREAM_HANDSHAKE=1 a single-token decode layer (or, see
+ * Without MTP (see qwen4_stream_handshake_enabled) a single-token decode layer (or, see
  * g_qwen4_hs_max_tokens, an MTP verification layer) is instead encoded
  * without knowing its experts:
  *
@@ -79,16 +79,24 @@ static void qwen4_handshake_report(void) {
  * use the handshake only with DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS=2 or 3. */
 static uint32_t g_qwen4_hs_max_tokens = 1u;
 
+/* On by default without MTP: with MTP nearly every step verifies two or
+ * three tokens, and its single-token steps measured no faster with the
+ * handshake. DS4_QWEN4_STREAM_HANDSHAKE=0 turns it off, =1 also with MTP. */
+static int g_qwen4_hs_mtp;
+
+void ds4_gpu_qwen4_stream_set_mtp(int mtp) {
+    g_qwen4_hs_mtp = mtp != 0;
+}
+
 static int qwen4_stream_handshake_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *env = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
-        enabled = env && strcmp(env, "1") == 0;
+    static int mode = -2;
+    if (mode == -2) {
+        mode = ds4_gpu_env_bool("DS4_QWEN4_STREAM_HANDSHAKE");
         g_qwen4_hs_max_tokens = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS",
                                                           1u, 1u, QWEN4_HS_MAX_TOKENS);
-        if (enabled && getenv("DS4_QWEN4_STREAM_HANDSHAKE_PROFILE")) atexit(qwen4_handshake_report);
+        if (mode != 0 && getenv("DS4_QWEN4_STREAM_HANDSHAKE_PROFILE")) atexit(qwen4_handshake_report);
     }
-    return enabled;
+    return mode > 0 || (mode < 0 && !g_qwen4_hs_mtp);
 }
 
 static void qwen4_handshake_fail(const char *why) {

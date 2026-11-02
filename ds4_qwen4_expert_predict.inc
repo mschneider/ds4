@@ -14,6 +14,9 @@
 
 int ds4_gpu_qwen4_stream_predict_set(const ds4_gpu_stream_expert_table *next,
                                      const ds4_gpu_tensor *ids, uint32_t n_ids);
+/* ds4_metal_stream_handshake.inc: the handshake applies by default only
+ * without MTP; the streamed MoE reports the graph's MTP state each layer. */
+void ds4_gpu_qwen4_stream_set_mtp(int mtp);
 
 #ifdef DS4_HAS_QWEN4_METAL
 static bool qwen4_stream_predict_next(ds4_qwen4_gpu_graph *g, const ds4_model *m,

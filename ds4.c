@@ -59827,6 +59827,7 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
             g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
             DS4_N_EXPERT, g->cap_tokens) != 0;
         if (ok) ok = qwen4_stream_predict_next(g, m, l, il, T);
+        ds4_gpu_qwen4_stream_set_mtp(g->mtp_R != NULL);
         if (ok) ok = ds4_gpu_qwen4_moe_stream_tensor(
             g->mid, g->part, g->mixed, g->selected,
             mm ? g->moe_lists : NULL, mm ? g->moe_counts : NULL, &table,
