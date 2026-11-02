@@ -299,22 +299,45 @@ about 18 ms less per token. About 0.25 ms per layer is still the drain's
 launch and wake-up latency.
 
 `DS4_QWEN4_STREAM_HANDSHAKE=1` (`ds4_metal_stream_handshake.inc`, off by
-default) removes that drain for decode and MTP verification (one to three
-tokens): the layer is encoded as router, GPU signal, GPU wait for the CPU,
-then the experts through the layer's expert address table, and committed at
-once. The CPU encodes the next layer, then waits for the signal, loads the
-missing experts, writes their addresses and releases the GPU. It first
-allocates the whole cache budget's slabs (slots stay unlocked until used),
-because the kernels must see every slab when they are encoded. Greedy output
-matched byte for byte with and without `--mtp`. In `ds4-bench` (4K prompt,
-256K allocation) steady decode was 21.1, 21.1 and 21.2 tok/s against 20.0,
-19.6 and 20.1 with early commit alone; `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1`
-showed the CPU waiting 0.91 ms per layer for the GPU and servicing a layer
-in 0.10 ms, so decode is now bound by GPU work rather than drains. CLI runs
-did not show the gain (warm 4K prompt, 256 tokens: 18.2 against 18.1
-without MTP, 19.0 and 16.8 against 18.9 and 19.0 with `--mtp`), and with a
-cold cache the GPU idles during every load, where the ordinary path runs the
-cached experts while the missing ones load. Hence opt-in.
+default) removes that drain for single-token decode: the router's ids are
+copied to shared words at the end of a command buffer, the next command
+buffer starts with a wait for a shared event, and the experts run through
+the layer's expert address table. The CPU encodes the next layer, then spins
+until the words hold the ids, loads the missing experts, writes their
+addresses and releases the GPU. It first allocates the whole cache budget's
+slabs (slots stay unlocked until used), because the kernels must see every
+slab when they are encoded. Greedy output matched byte for byte on two
+prompts with and without `--mtp`. `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1`
+showed the CPU waiting about 0.9 ms per layer for the GPU and servicing a
+layer in 0.1 ms, so decode is bound by GPU work rather than drains.
+
+Interleaved on the M4 Pro (Q2, AC power, powermode 2; tok/s):
+
+| Configuration | ds4-bench decode | ds4-bench steady | CLI, no MTP | CLI, `--mtp` |
+| --- | ---: | ---: | ---: | ---: |
+| early commit off | 16.0-17.0 | 19.0-19.2 | | |
+| early commit (default) | 17.4-17.7 | 19.5-20.0 | 18.0, 18.2 | 17.1, 19.8 |
+| early commit + handshake | 19.0-19.4 | 21.9-22.1 | 19.0, 19.2 | 15.2, 19.1 |
+
+ds4-bench: 4K-token `promessi_sposi.txt` prompt, 128 tokens, 256K allocation,
+three rounds. CLI: warm 4K-token prompt, 256 tokens, `--ctx 32768`, two
+rounds, identical output in every run. Prefill did not change. With `--mtp`
+only the single-token steps use the handshake and the result is noisy but
+not better.
+
+What was measured or ruled out on the way:
+- Signaling arrival with the shared event instead of the words: steady
+  decode 20.7-20.8 against 20.8-21.5 tok/s (ds4-bench, three rounds).
+- Running the cached experts while the missing ones load (two passes whose
+  slot masks the CPU writes into a shared argument buffer): about 5% faster
+  without MTP, but it changed the greedy output, in single-token and MTP
+  runs alike, depending on timing. The CPU then rewrites expert slots while
+  the GPU runs in the same command buffer, which can leave stale GPU cache
+  lines; removed.
+- MTP verification steps (`DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS=3`): about
+  5% slower than the ordinary path (20.6 and 20.5 against 21.9 and 21.4
+  tok/s), as three tokens miss more experts and the GPU waits for every
+  load. MTP steps therefore keep the ordinary path by default.
 
 `DS4_QWEN4_TIMING=2` now also reports single-token decode stages: it drains
 the GPU after each stage and prints the GPU execution time per token (wall
@@ -326,8 +349,17 @@ before the MoE 3.7 ms, MoE 11.0 ms (router 1.2, routed and shared gate/up
 37 ms in all against about 47 ms per token in ordinary decode. The IQ2_XXS
 gate/up kernels read about a third of the memory bandwidth's worth of
 weights; specialized decode kernels (`DS4_QWEN4_MOE_MV_SPECIALIZE=1`, 12.2
-ms), other row and group counts, and `DS4_QWEN4_DECODE_FUSIONS=1` did not
-help on M4.
+ms), the threadgroup-table IQ2_XXS kernel (`DS4_QWEN4_MOE_MV_SPECIALIZE=0`,
+14.0 ms with its generic down kernel), other row and group counts, and
+`DS4_QWEN4_DECODE_FUSIONS=1` did not help on M4. Neither did rewritten
+gate/up kernels with the same arithmetic: 64-bit grid loads (11.2-11.3 ms
+against 11.0-11.4), grid and sign tables in threadgroup memory (11.7-13.3),
+two or five blocks' loads issued per step (11.3-11.4, 12.6), or two rows per
+SIMD group (11.4-11.7). Both routed kernels read their cached experts at
+about 75-100 GB/s while the router reaches about 160 GB/s from the model
+mapping; the experts are scattered 1.5 MB slots in 13 GiB of locked 16 KB
+pages, which points at address translation rather than the kernels' code
+(not verified with a GPU profiler).
 
 `DS4_STREAM_NOCACHE=1` (`ds4_stream_nocache.inc`, off by default) reads
 streamed experts through a second F_NOCACHE descriptor of the model and the
