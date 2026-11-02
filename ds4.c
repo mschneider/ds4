@@ -59731,6 +59731,8 @@ static const ds4_gpu_tensor *qwen4_bf16_weights(const ds4_model *m, const ds4_te
 }
 #endif
 
+#include "ds4_qwen4_expert_predict.inc"
+
 static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                 uint32_t il, uint32_t T, bool last_only) {
     const bool profile = !g->ssd_streaming && T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
@@ -59824,6 +59826,7 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
         if (ok && mm) ok = ds4_gpu_qwen4_moe_build_lists_tensor(
             g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
             DS4_N_EXPERT, g->cap_tokens) != 0;
+        if (ok) ok = qwen4_stream_predict_next(g, m, l, il, T);
         if (ok) ok = ds4_gpu_qwen4_moe_stream_tensor(
             g->mid, g->part, g->mixed, g->selected,
             mm ? g->moe_lists : NULL, mm ? g->moe_counts : NULL, &table,

@@ -258,6 +258,32 @@ Prefill, which misses the cache for most experts, gained 6%; decode at 4K,
 where the 13 GiB expert cache serves most experts, gained 1 to 2%. The
 macOS page cache was not purged between runs and swap held about 18 GiB.
 
+## Next-layer expert prediction (fork, off by default)
+
+`DS4_QWEN4_STREAM_PREDICT=1` runs layer l+1's router on layer l's MoE input
+during streamed single-token decode and starts loading its top-10 experts
+that are not cached as soon as layer l's experts are submitted (Strata's Mac
+engine does the same). The next layer joins those reads after its GPU sync.
+Routing is unchanged, and greedy output matched prediction off byte for byte.
+`ds4_qwen4_expert_predict.inc` (graph side) and
+`ds4_metal_expert_predict.inc` (loads) hold the code;
+`DS4_QWEN4_STREAM_PREDICT_PROFILE=1` prints its accuracy per guess rank.
+
+It is off because it did not pay on an M4 Pro 48 GB with the Q2 pack and the
+default 256K context (13 GiB expert cache). With a 4K prompt, decode misses
+about 7.8 experts per token (8.7 ms of reads and 4.7 ms of binding in a 53
+ms token), but 68.5% of the guesses were right mostly for experts already
+cached: of the guesses that had to be loaded only 11.5% were used (7 to 21%
+by rank), so each token read about 30 MB more and evicted useful experts.
+The loads therefore pause for about 128 tokens whenever fewer than
+`DS4_QWEN4_STREAM_PREDICT_MIN_USE` (0.25) of the last 128 loaded guesses
+were used. Interleaved `ds4-bench` runs (4K and 256-token prompts, 128
+tokens) still measured prediction on at or below prediction off, but the
+same arm varied by up to 30% between runs (14.9 to 19.8 tok/s) while swap
+held 17 GiB, so the comparison is not conclusive. A short CLI prompt with a
+cold cache decoded 14.35 tok/s against 13.02 (one run each), where 40% of
+the loaded guesses were used. The guesses cost no measurable GPU time.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3

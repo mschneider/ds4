@@ -51103,6 +51103,8 @@ static int qwen4_stream_missing_gate_up_ready(
     return ok;
 }
 
+#include "ds4_metal_expert_predict.inc"
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -51324,6 +51326,7 @@ done:
      * reuse. Restore the caller's batch ownership after completing that work. */
     if (!ok && overlap.started && (g_batch_cb || [g_pending_cbs count] != 0))
         (void)ds4_gpu_synchronize();
+    qwen4_stream_predict_after_layer(ok, table->layer, ids, (uint32_t)n_ids);
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
     free(ids);
