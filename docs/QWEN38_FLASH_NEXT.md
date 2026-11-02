@@ -358,8 +358,24 @@ two or five blocks' loads issued per step (11.3-11.4, 12.6), or two rows per
 SIMD group (11.4-11.7). Both routed kernels read their cached experts at
 about 75-100 GB/s while the router reaches about 160 GB/s from the model
 mapping; the experts are scattered 1.5 MB slots in 13 GiB of locked 16 KB
-pages, which points at address translation rather than the kernels' code
-(not verified with a GPU profiler).
+pages. A standalone Metal benchmark ruled that out: reading eleven 1.5 MB
+slots scattered over 8 GiB ran as fast as a contiguous read (about 250 GB/s
+once the pages are locked, mapped file or anonymous; about 146 GB/s
+unlocked). The gate/up kernel is compute-bound instead: in the same
+benchmark (11 slots x 640 rows x 2560 inputs) the upstream kernel took about
+103 us per layer, the same work without grid or sign lookups 93 us, and a
+plain read of its bytes 38 us. Other lane layouts, threadgroup tables, float
+grid tables and sign-bit flips stayed at or above 100 us; half-precision
+products reached 90 us but changed the results.
+
+With `--mtp` (warm 4K prompt, 32K context, GPU otherwise idle) a two-token
+verification step took 54.0 ms of GPU time against 48 ms for a one-token
+step; its MoE took 20.5 ms against 15.3 ms. The tokens of a verification
+step selected 21 routed experts per layer, 16.6 of them distinct. Kernels
+that decode a shared expert once for every token that selected it, with
+each token's arithmetic unchanged (output stayed identical), made the MoE
+slower (21.8-22.4 ms against 20.6-21.4): the per-token arithmetic dominates,
+and the merged rows become the dispatch's tail. They were removed.
 
 `DS4_STREAM_NOCACHE=1` (`ds4_stream_nocache.inc`, off by default) reads
 streamed experts through a second F_NOCACHE descriptor of the model and the
