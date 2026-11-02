@@ -1355,9 +1355,17 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 }
 
 static int qwen4_stream_handshake_service_all(void);  /* ds4_metal_stream_handshake.inc */
+/* GPU execution time of waited command buffers, for DS4_QWEN4_TIMING=2 (fork). */
+static double g_gpu_span_accum_ms;
+double ds4_gpu_take_gpu_span_ms(void) {
+    const double ms = g_gpu_span_accum_ms;
+    g_gpu_span_accum_ms = 0.0;
+    return ms;
+}
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     const int handshake_ok = qwen4_stream_handshake_service_all();
     [cb waitUntilCompleted];
+    g_gpu_span_accum_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
     if (!handshake_ok) return 0;
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;

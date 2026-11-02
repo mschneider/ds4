@@ -60104,6 +60104,14 @@ static bool qwen4_graph_tokens_fit(const ds4_qwen4_gpu_graph *g,
     return true;
 }
 
+/* GPU execution time of the command buffers waited since the last call
+ * (fork; DS4_QWEN4_TIMING=2 decode stages). */
+#ifdef DS4_HAS_QWEN4_METAL
+double ds4_gpu_take_gpu_span_ms(void);
+#else
+static double ds4_gpu_take_gpu_span_ms(void) { return 0.0; }
+#endif
+
 static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t T,
         float *logits_out, bool all_rows, qwen4_projection_phase phase,
@@ -60142,13 +60150,21 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
+    const bool prof_on = timing == 2;
     double prof_last = prof_on ? now_sec() : 0.0;
+    /* Single-token steps also sum GPU execution time per stage (fork). */
+    static double prof_gpu[6], prof_wall[6];
+    static uint32_t prof_tokens;
+    if (prof_on) (void)ds4_gpu_take_gpu_span_ms();
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
             ds4_gpu_end_commands(); \
             const double now_ = now_sec(); \
             prof[idx_] += now_ - prof_last; \
+            if (T == 1u) { \
+                prof_wall[idx_] += 1e3 * (now_ - prof_last); \
+                prof_gpu[idx_] += ds4_gpu_take_gpu_span_ms(); \
+            } \
             prof_last = now_; \
             glm_graph_begin_commands_if_needed(); \
         } \
@@ -60212,7 +60228,16 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
          * end_commands below waits for both batches before inputs are reused. */
         if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
-    if (prof_on) {
+    if (prof_on && T == 1u && ++prof_tokens % 32u == 0u) {
+        fprintf(stderr, "ds4: Qwen3.8 decode stage ms/token, GPU (wall): ple %.2f (%.2f) hc_attn %.2f (%.2f) "
+                "gdn %.2f (%.2f) attn %.2f (%.2f) hc_ffn %.2f (%.2f) moe %.2f (%.2f)\n",
+                prof_gpu[0] / 32, prof_wall[0] / 32, prof_gpu[1] / 32, prof_wall[1] / 32,
+                prof_gpu[2] / 32, prof_wall[2] / 32, prof_gpu[3] / 32, prof_wall[3] / 32,
+                prof_gpu[4] / 32, prof_wall[4] / 32, prof_gpu[5] / 32, prof_wall[5] / 32);
+        memset(prof_gpu, 0, sizeof(prof_gpu));
+        memset(prof_wall, 0, sizeof(prof_wall));
+    }
+    if (prof_on && T > 1u) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
                 "ple %.1f hc_attn %.1f gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n",
                 pos0, T, ok ? 1 : 0, 1000.0 * prof[0], 1000.0 * prof[1],

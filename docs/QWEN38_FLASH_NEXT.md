@@ -316,6 +316,19 @@ without MTP, 19.0 and 16.8 against 18.9 and 19.0 with `--mtp`), and with a
 cold cache the GPU idles during every load, where the ordinary path runs the
 cached experts while the missing ones load. Hence opt-in.
 
+`DS4_QWEN4_TIMING=2` now also reports single-token decode stages: it drains
+the GPU after each stage and prints the GPU execution time per token (wall
+time in parentheses) every 32 tokens. On the M4 Pro with the Q2 model at a
+512-token context the GPU spent per token: PLE 0.2 ms, HC mixers before
+attention 3.5 ms, GDN layers 11.0 ms, full attention 4.8 ms, HC mixers
+before the MoE 3.7 ms, MoE 11.0 ms (router 1.2, routed and shared gate/up
+6.0, down 3.4, reduce 0.45) and about 3.2 ms for the output head, about
+37 ms in all against about 47 ms per token in ordinary decode. The IQ2_XXS
+gate/up kernels read about a third of the memory bandwidth's worth of
+weights; specialized decode kernels (`DS4_QWEN4_MOE_MV_SPECIALIZE=1`, 12.2
+ms), other row and group counts, and `DS4_QWEN4_DECODE_FUSIONS=1` did not
+help on M4.
+
 `DS4_STREAM_NOCACHE=1` (`ds4_stream_nocache.inc`, off by default) reads
 streamed experts through a second F_NOCACHE descriptor of the model and the
 pack, and skips the F_RDADVISE readahead, so the OS file cache no longer keeps
