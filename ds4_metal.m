@@ -699,6 +699,7 @@ static int g_model_fd = -1;
 static void ds4_expert_pack_attach(int model_fd);
 static void ds4_expert_pack_detach(void);
 static int ds4_expert_pack_readahead(uint64_t off, uint64_t len);
+#include "ds4_stream_nocache.inc"
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -11843,6 +11844,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_fd = -1;
+        ds4_stream_nocache_close();
         ds4_expert_pack_detach();
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
@@ -12804,7 +12806,7 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 }
 
 int ds4_gpu_set_model_fd(int fd) {
-    g_model_fd = fd;
+    g_model_fd = ds4_stream_nocache_fd_for(fd);
     ds4_expert_pack_attach(fd);
     return 1;
 }
@@ -13244,6 +13246,7 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
     if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
         return;
     }
+    if (g_stream_nocache_fd >= 0) return;
     if (ds4_expert_pack_readahead(offset, len)) return;
 
 #if defined(F_RDADVISE)
@@ -51104,6 +51107,7 @@ static int qwen4_stream_missing_gate_up_ready(
 }
 
 #include "ds4_metal_expert_predict.inc"
+#include "ds4_metal_stream_overlap.inc"
 
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
@@ -51330,6 +51334,7 @@ done:
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
     free(ids);
+    ok = qwen4_stream_early_commit(ok, had_batch, n_tokens);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;
     if (had_batch && !g_batch_cb && !ds4_gpu_begin_commands()) ok = 0;
     return ok;

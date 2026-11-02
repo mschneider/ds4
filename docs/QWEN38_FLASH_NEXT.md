@@ -284,6 +284,44 @@ held 17 GiB, so the comparison is not conclusive. A short CLI prompt with a
 cold cache decoded 14.35 tok/s against 13.02 (one run each), where 40% of
 the loaded guesses were used. The guesses cost no measurable GPU time.
 
+## Early commit and uncached reads for streamed decode (fork)
+
+Each streamed decode layer starts with a full GPU drain, because the CPU
+needs the router's expert ids before it can load experts. The layer's expert
+work used to wait in the open command buffer until the next layer's drain
+committed it, so the GPU idled while the CPU encoded the reduce and the next
+layer's attention and router. That buffer is now committed as soon as the
+experts are encoded (`ds4_metal_stream_overlap.inc`;
+`DS4_QWEN4_STREAM_EARLY_COMMIT=0` restores the old behaviour). Greedy output
+is byte-identical. A 512-token prompt run with `DS4_METAL_CB_TIMES=1` went
+from 0.21 ms CPU encode + 1.13 ms drain wait per layer to 0.11 + 0.82 ms,
+about 18 ms less per token. About 0.25 ms per layer is still the drain's
+launch and wake-up latency; removing it needs the per-layer event handshake
+in one command buffer (not implemented).
+
+`DS4_STREAM_NOCACHE=1` (`ds4_stream_nocache.inc`, off by default) reads
+streamed experts through a second F_NOCACHE descriptor of the model and the
+pack, and skips the F_RDADVISE readahead, so the OS file cache no longer keeps
+a second copy of them. It did not help on the M4 Pro: decode was about 3%
+slower, the file cache stayed near 8 GiB (mostly the mapped dense weights),
+and swap did not change.
+
+M4 Pro 48 GB, Q2, `ds4-bench` with the 4K-token `promessi_sposi.txt` prompt,
+128 tokens, `--ctx-alloc 262144` (13.3 GiB expert cache), three interleaved
+rounds, AC power and powermode 2 (tok/s, min to max):
+
+| Configuration | Prefill | Decode | Steady decode |
+| --- | ---: | ---: | ---: |
+| no pack (`DS4_EXPERT_PACK=0`) | 216-224 | 15.0-16.4 | 17.2-19.0 |
+| pack | 222-225 | 16.2-16.8 | 18.7-19.3 |
+| pack + early commit | 220-230 | 16.8-17.4 | 19.7-20.0 |
+| pack + early commit + no cache | 226-229 | 15.1-16.9 | 18.0-20.4 |
+| pack + early commit + prediction | 223-226 | 15.4-17.0 | 17.4-19.8 |
+
+At `--ctx-alloc 32768` (22.3 GiB cache) early commit measured steady decode
+of 17.1, 17.8 and 21.0 tok/s against 17.1, 16.0 and 17.6 without it, and on
+the 512-token prompt 20.2 against 15.2.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3

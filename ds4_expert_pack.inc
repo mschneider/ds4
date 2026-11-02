@@ -187,6 +187,9 @@ static void ds4_expert_pack_attach(int model_fd) {
         return;
     }
 
+    /* DS4_STREAM_NOCACHE: see ds4_stream_nocache.inc. */
+    const char *nocache = getenv("DS4_STREAM_NOCACHE");
+    if (nocache && strcmp(nocache, "1") == 0) (void)fcntl(fd, F_NOCACHE, 1);
     g_expert_pack_fd = fd;
     g_expert_pack_model_fd = model_fd;
     g_expert_pack_model_dev = ms.st_dev;
