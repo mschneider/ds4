@@ -690,37 +690,54 @@ kernel void kernel_bonsai2_gemm(
 
     bonsai2_u8 ra[AUT], rb[BUT];
 
+    /* A units: when they divide evenly, a thread takes AUT consecutive units
+     * (adjacent 8-weight groups of one row, one scale load); otherwise unit
+     * tid + u * NT.  Source pointers are fixed for the whole K loop; load(k)
+     * only adds the K offset.  Past-the-edge rows read a valid row whose
+     * results land outside the stored region. */
+    constexpr bool AC = AU % NT == 0;
+    auto aunit = [&](short u) -> short { return AC ? (short)(tid * AUT + u) : (short)(tid + u * NT); };
+    device const uchar *pa[AUT];
+    device const uchar *pb[BUT];
+    short ga[AUT];
+    for (short u = 0; u < AUT; u++) {
+        const short unit = min(aunit(u), (short)(AU - 1));
+        const short row = min((short)(unit / 4), (short)(nr0 - 1));
+        ga[u] = unit % 4;
+        pa[u] = AQ ? w + (ulong)(r0 + row) * a.row_bytes
+                   : w + ((ulong)(r0 + row) * a.in_dim + 8 * ga[u]) * 2;
+    }
+    for (short u = 0; u < BUT; u++) {
+        const short unit = min((short)(tid + u * NT), (short)(BU - 1));
+        const short tok = min((short)(unit / 4), (short)(nr1 - 1)), g = unit % 4;
+        pb[u] = x + ((ulong)(r1 + tok) * a.in_dim + 8 * g) * (BH ? 2 : 4);
+    }
+
     auto load = [&](uint k) {
         for (short u = 0; u < AUT; u++) {
-            const short unit = tid + u * NT;
-            if (AU % NT != 0 && unit >= AU) break;
-            const short row = min((short)(unit / 4), (short)(nr0 - 1)), g = unit % 4;
-            const uint kk = k + 8 * g;
+            if (!AC && aunit(u) >= AU) break;
             if (AQ) {
-                device const uchar *blk = w + (ulong)(r0 + row) * a.row_bytes + (kk / BONSAI2_QK) * BONSAI2_QBYTES;
+                device const uchar *blk = pa[u] + (k / BONSAI2_QK) * BONSAI2_QBYTES;
                 const half d = *(device const half *)blk;
-                const ushort q = *(device const ushort *)(blk + 2 + 2 * ((kk % BONSAI2_QK) / 8));
+                const ushort q = *(device const ushort *)(blk + 2 + 2 * ((k % BONSAI2_QK) / 8 + ga[u]));
                 for (short i = 0; i < 4; i++) {
                     ra[u].lo[i] = (half)((short)((q >> (2 * i)) & 3) - 1) * d;
                     ra[u].hi[i] = (half)((short)((q >> (2 * (i + 4))) & 3) - 1) * d;
                 }
             } else {
-                device const half4 *p = (device const half4 *)(w + ((ulong)(r0 + row) * a.in_dim + kk) * 2);
+                device const half4 *p = (device const half4 *)(pa[u] + (ulong)k * 2);
                 ra[u].lo = p[0];
                 ra[u].hi = p[1];
             }
         }
         for (short u = 0; u < BUT; u++) {
-            const short unit = tid + u * NT;
-            if (BU % NT != 0 && unit >= BU) break;
-            const short tok = min((short)(unit / 4), (short)(nr1 - 1)), g = unit % 4;
-            const ulong e = (ulong)(r1 + tok) * a.in_dim + k + 8 * g;
+            if (BU % NT != 0 && tid + u * NT >= BU) break;
             if (BH) {
-                device const half4 *p = (device const half4 *)(x + e * 2);
+                device const half4 *p = (device const half4 *)(pb[u] + (ulong)k * 2);
                 rb[u].lo = p[0];
                 rb[u].hi = p[1];
             } else {
-                device const float4 *p = (device const float4 *)(x + e * 4);
+                device const float4 *p = (device const float4 *)(pb[u] + (ulong)k * 4);
                 rb[u].lo = (half4)clamp(p[0], -65504.0f, 65504.0f);
                 rb[u].hi = (half4)clamp(p[1], -65504.0f, 65504.0f);
             }
@@ -728,8 +745,8 @@ kernel void kernel_bonsai2_gemm(
     };
     auto store = [&]() {
         for (short u = 0; u < AUT; u++) {
-            const short unit = tid + u * NT;
-            if (AU % NT != 0 && unit >= AU) break;
+            const short unit = aunit(u);
+            if (!AC && unit >= AU) break;
             const short row = unit / 4, g = unit % 4;
             threadgroup half *dst = sa + 64 * (g * (BM / 8) + row / 8) + row % 8;
             for (short i = 0; i < 4; i++) {

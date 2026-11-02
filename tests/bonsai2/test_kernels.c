@@ -921,11 +921,14 @@ static void bench_gemm(const char *filter, const char *tok_list) {
         {"ffn_gate_up", 5120, 17408}, {"ffn_down", 17408, 5120}, {"lin_qkv", 5120, 10240},
         {"lin_z", 5120, 6144}, {"out_6144", 6144, 5120}, {"attn_q", 5120, 12288}, {"attn_kv", 5120, 1024},
     };
-    uint32_t toks[8], nt = 0;
+    uint32_t toks[32], nt = 0;
     {
-        char buf[128];
+        char buf[512];
         snprintf(buf, sizeof(buf), "%s", tok_list ? tok_list : "512,2048,4096");
-        for (char *t = strtok(buf, ","); t && nt < 8; t = strtok(NULL, ",")) toks[nt++] = (uint32_t)atoi(t);
+        for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
+            if (nt == 32) { fprintf(stderr, "bench-gemm: at most 32 token counts; ignoring the rest\n"); break; }
+            toks[nt++] = (uint32_t)atoi(t);
+        }
     }
     printf("shape,in,out,n_tok,cfg,ms,tflops\n");
     for (uint32_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {

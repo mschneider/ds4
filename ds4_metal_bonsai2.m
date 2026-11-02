@@ -245,12 +245,13 @@ int ds4_gpu_bonsai2_matmul_cfg_tensor(
 /* Production prefill tile.  Auto (the default) picks per call between a
  * narrow and a wide tile: the one with fewer padded token rows, weighted
  * by the wide tile's per-row cost relative to the narrow one.  On M4 Pro
- * 64x64_2x2 costs about 0.88x of 64x32_2x2 per padded token on every Bonsai
- * projection shape, so the narrow tile wins only at 9-32 and 65-96 tokens.
+ * 64x64_2x2 costs about 0.91x of 64x32_2x2 per padded token from 96 tokens
+ * on, so the narrow tile wins where padding to 64 wastes more: 9-32, 65-96,
+ * 129-160, 193-224 and 257-288 tokens.
  * A forced tile (index into g_bonsai2_gemm_tiles) skips the rule. */
 static uint32_t g_bonsai2_gemm_tile = UINT32_MAX;   /* auto; see bonsai2_gemm_tile_for */
 static uint32_t g_bonsai2_gemm_auto_narrow = 0, g_bonsai2_gemm_auto_wide = 1;
-static double   g_bonsai2_gemm_auto_ratio = 0.88;
+static double   g_bonsai2_gemm_auto_ratio = 0.91;
 static uint32_t g_bonsai2_gemm_pf = 0;
 
 static int bonsai2_tile_by_name(const char *s, uint32_t *tile) {
@@ -273,7 +274,7 @@ static uint32_t bonsai2_env_count(const char *name, uint32_t off_value, uint32_t
 /* Tuning overrides for other chips (docs/BONSAI2_27B.md, "Tuning the
  * prefill GEMM"), read once before the first prefill GEMM or setter call:
  *   DS4_BONSAI2_GEMM_TILE      auto | BMxBN_WMxWN (one of g_bonsai2_gemm_tiles)
- *   DS4_BONSAI2_GEMM_AUTO      NARROW,WIDE,RATIO for auto, e.g. 64x32_2x2,64x64_2x2,0.88
+ *   DS4_BONSAI2_GEMM_AUTO      NARROW,WIDE,RATIO for auto, e.g. 64x32_2x2,64x64_2x2,0.91
  *   DS4_BONSAI2_GEMM_PREFETCH  0 | 1
  *   DS4_BONSAI2_UNPACK_MIN     tokens from which weights are unpacked to F16, or off
  *   DS4_BONSAI2_HALF_ACT_MIN   tokens from which GEMM inputs are half, or off

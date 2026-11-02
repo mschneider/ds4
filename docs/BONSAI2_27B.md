@@ -116,8 +116,15 @@ either: the rotations store exactly the value the GEMM would round to
 Defaults (M4 Pro): **half activations** for every prefill GEMM, PQ2_0
 weights below 2048 tokens and **F16 weights from 2048**, **no prefetch**, and
 an automatic tile choice between `64x32_2x2` and `64x64_2x2`: the wide tile
-costs about 0.88× the narrow one per padded token row, so the narrow one
-runs only where padding to 64 wastes more (9–32 and 65–96 tokens).
+costs about 0.91× the narrow one per padded token row, so the narrow one
+runs only where padding to 64 wastes more (9–32, 65–96, 129–160, 193–224
+and 257–288 tokens).
+
+Each thread stages consecutive 8-weight groups of one weight row (one block
+scale read for 16 weights in the narrow tile) from source pointers computed
+once per threadgroup. That loader layout was worth 2–4% on the narrow tile
+and about 1% on the wide one over per-step address math with units 32 rows
+apart, and it fixed a 2% loss against the old fused kernel at 219 tokens.
 
 How close that is to the hardware: `test_kernels --mma-peak` measures the
 simdgroup MMA ceiling of the M4 Pro at 6.0–6.2 TFLOPS. The best
@@ -145,17 +152,25 @@ Prefetch never helped, larger tiles (128 rows or tokens, 8–16 simdgroups)
 lost on every shape, and F16 weights pay for their unpack only from about
 2048 tokens.
 
-Whole-model prefill, defaults against `5c1523e` (same attention, previous
-GEMM path), M4 Pro on AC in High Power Mode, two interleaved runs each, same
-greedy output:
+Whole-model prefill (t/s), M4 Pro on AC in High Power Mode, cold process
+per run, median of 2–3 interleaved runs, same greedy output everywhere:
+`5c1523e` (same attention, previous fused 64×32 GEMM), `b5ad4de` (first
+GEMM family), and the current loader with auto ratio 0.91:
 
-| prompt | before | after |
-|---|---:|---:|
-| ~160 tokens | 96.1 t/s | 94.9 t/s (−1.3%, under investigation) |
-| ~520 tokens | 103.4 t/s | 108.7 t/s |
-| ~1020 tokens | 105.3 t/s | 108.6 t/s |
-| 4069 tokens | 108.0 t/s | 110.5 t/s |
-| ~16k tokens | 100.7 t/s | 103.0 t/s (one valid run; chunk 4096: 102.8 and 103.1) |
+| prompt | `5c1523e` | `b5ad4de` | current |
+|---|---:|---:|---:|
+| 169 tokens | 86.7 | 94.1 | 95.2 |
+| 219 tokens | 96.6 | 95.3 | 97.2 |
+| 279 tokens | | 95.5 | 97.8 (ratio 0.88: 97.0) |
+| 319 tokens | 99.9 | 108.5 | 109.9 |
+| 569 tokens | 102.8 | 109.5 | 110.7 |
+| 4069 tokens | 108.0 | 110.0 | 111.8 |
+| ~16k tokens | 100.7 | 103.5 | 104.5 |
+
+The `5c1523e` column for 4069 and ~16k tokens comes from an earlier grid
+session; everything else is from same-session interleaved runs. Short
+prompts carry a one-time cost of about 2.5 t/s for pipeline creation inside
+the first prefill, the same for every version.
 
 In the same grid, half activations off cost about 3% at every length,
 unpacking from 1024 instead of 2048 tokens was within noise, unpacking never
@@ -172,7 +187,7 @@ bit-identical), so tuning on another chip is safe:
 | Variable | Default | Meaning |
 |---|---|---|
 | `DS4_BONSAI2_GEMM_TILE` | `auto` | force one tile, e.g. `64x64_2x2` |
-| `DS4_BONSAI2_GEMM_AUTO` | `64x32_2x2,64x64_2x2,0.88` | auto's narrow tile, wide tile, and the wide tile's cost per padded token relative to the narrow one |
+| `DS4_BONSAI2_GEMM_AUTO` | `64x32_2x2,64x64_2x2,0.91` | auto's narrow tile, wide tile, and the wide tile's cost per padded token relative to the narrow one |
 | `DS4_BONSAI2_GEMM_PREFETCH` | `0` | prefetch the next K step |
 | `DS4_BONSAI2_UNPACK_MIN` | `2048` | tokens from which weights are unpacked to F16 (`off`: never) |
 | `DS4_BONSAI2_HALF_ACT_MIN` | `9` | tokens from which GEMM inputs are half (`off`: never) |
@@ -240,6 +255,7 @@ Each line is a claim from the M4 Pro and the command that checks it.
 | `attn_fa` 3.3–3.4 TFLOPS at 4–8k tokens, ~3.8× the Qwen3.8 kernel | `test_kernels --bench-attn` |
 | Prefill table above (defaults vs `5c1523e`) | `tests/bonsai2/prefill_grid.sh` with both binaries |
 | Half activations off cost ~3% end to end | `prefill_grid.sh "X=1" "DS4_BONSAI2_HALF_ACT_MIN=off"` |
+| Auto ratio 0.91 (narrow tile at 9–32, 65–96, 129–160, 193–224, 257–288 tokens) | `gemm_rank.py` ratio line from 96 tokens on; `prefill_grid.sh -p 21 "X=1" "DS4_BONSAI2_GEMM_AUTO=64x32_2x2,64x64_2x2,0.88"` |
 
 ### Prefill attention
 
