@@ -695,6 +695,10 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/* ds4_expert_pack.inc, included after the streaming pread task type. */
+static void ds4_expert_pack_attach(int model_fd);
+static void ds4_expert_pack_detach(void);
+static int ds4_expert_pack_readahead(uint64_t off, uint64_t len);
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -11839,6 +11843,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_fd = -1;
+        ds4_expert_pack_detach();
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -12800,6 +12805,7 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    ds4_expert_pack_attach(fd);
     return 1;
 }
 
@@ -13238,6 +13244,7 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
     if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
         return;
     }
+    if (ds4_expert_pack_readahead(offset, len)) return;
 
 #if defined(F_RDADVISE)
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
@@ -13275,7 +13282,14 @@ typedef struct {
     uint64_t read_bytes;
     double ms;
     int ok;
+    /* ds4_expert_pack.inc: read from the expert pack, plus merged tails. */
+    uint32_t pack;
+    uint32_t pack_tails;
+    uint8_t *tail_dst[2];
+    uint64_t tail_len[2];
 } ds4_gpu_stream_expert_pread_task;
+
+#include "ds4_expert_pack.inc"
 
 typedef struct {
     int active;
@@ -13425,6 +13439,10 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
+        if (task->pack) {
+            task->ok = ds4_expert_pack_run_task(task);
+            continue;
+        }
         task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
                                                     task->len,
                                                     task->dst,
@@ -13484,11 +13502,12 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->ms);
+            task->ok = task->pack ? ds4_expert_pack_run_task(task) :
+                ds4_gpu_stream_expert_pread_into(task->offset,
+                                                 task->len,
+                                                 task->dst,
+                                                 &task->read_bytes,
+                                                 &task->ms);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -13558,6 +13577,7 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
         uint32_t n_tasks,
         uint32_t n_workers) {
     if (n_workers <= 1) return 0;
+    ds4_expert_pack_coalesce(tasks, n_tasks);
     const uint32_t limit = ds4_gpu_stream_expert_pread_thread_limit();
     if (!ds4_gpu_stream_expert_pread_pool_init(limit)) return 0;
 
@@ -13649,6 +13669,7 @@ static int ds4_gpu_stream_expert_pread_tasks(
     if (total_bytes) *total_bytes = 0;
     if (wall_ms) *wall_ms = 0.0;
     if (!tasks || n_tasks == 0) return 1;
+    ds4_expert_pack_coalesce(tasks, n_tasks);
 
     const uint32_t n_workers =
         ds4_gpu_stream_expert_pread_thread_count(n_tasks);

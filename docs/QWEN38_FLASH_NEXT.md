@@ -214,6 +214,36 @@ replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
 longer contexts, with a possible quality cost on shorter prompts.
 
+## Expert pack for SSD streaming (fork)
+
+With `--ssd-streaming`, a missing expert's gate, up and down rows come from
+three tensors far apart in the GGUF, so each expert costs three SSD requests.
+`gguf-tools/expert_pack.py MODEL.gguf` writes `MODEL.gguf.experts`, a second
+copy of the routed experts in which each expert's three slices sit together
+in one 16 KiB-aligned record (35.4 GiB for the Q2 pack, written in about 25 s
+on an M4 Pro). The idea comes from Strata's Mac engine, which measured 17%
+faster decoding and 30% faster prompts from it on a 32 GB M4.
+
+ds4 picks the file up when it sits next to the model (after resolving
+symlinks), checks it against the model's size and the bytes at both ends of
+every expert tensor, and ignores it with a warning when they differ. The
+expert cache, its keys and the kernels are unchanged: only reads whose range
+lies inside one expert's slice are redirected to the pack, and reads that
+continue each other there are merged into one `preadv`. Whole-tensor reads
+and everything else still read the model, which stays required.
+
+| Variable | Effect |
+| --- | --- |
+| `DS4_EXPERT_PACK=0` | Ignore the pack |
+| `DS4_EXPERT_PACK=PATH` | Use the pack at `PATH` |
+| `DS4_EXPERT_PACK_VERIFY=1` | Compare every redirected range with the model (debug, slow) |
+
+`python3 tests/test_expert_pack.py` round-trips a synthetic GGUF through the
+writer and the reader (`ds4_expert_pack.inc`), including a corrupted and a
+truncated pack. On the Q2 pack a greedy 96-token generation with
+`DS4_EXPERT_PACK_VERIFY=1` matched the model byte for byte and produced the
+same text as `DS4_EXPERT_PACK=0`.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3
