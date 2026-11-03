@@ -59403,7 +59403,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g, g->lo, m, down, g->xn, T);
     if (T > 8u &&
-        up->type != DS4_TENSOR_Q8_0) {
+        (up->type != DS4_TENSOR_Q8_0 || T > 64u)) {   /* fork: Q8_0 prompt chunks too */
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g, g->hc_u, m, up, g->hc_lo_act, T) &&

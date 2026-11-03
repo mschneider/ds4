@@ -4815,6 +4815,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
+        @[@"DS4_METAL_QWEN4_FORK_SOURCE", @"metal/qwen4_fork.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
     ];
 
@@ -48577,6 +48578,7 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_FORK_HC_GATE_MIX_Q8,
     QWEN4_K_COUNT,
 };
 
@@ -48701,6 +48703,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_fork_hc_gate_mix_q8",
 };
 
 typedef struct {
@@ -49123,6 +49126,12 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         return 0;
     }
     const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
+    /* fork: Q8_0 mixer with a shared SiLU (metal/qwen4_fork.metal). Every
+     * row count uses it, so MTP verify rows round like single-token steps. */
+    if (weight_type == 8u)
+        return qwen4_dispatch(QWEN4_K_FORK_HC_GATE_MIX_Q8, &args, sizeof(args), b, 4,
+                              MTLSizeMake((n_embd + 15u) / 16u, n_tokens, 1), MTLSizeMake(16u * 32u, 1, 1),
+                              (NSUInteger)n_rank * sizeof(float));
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
      * against the plain kernel by tests/test_qwen4_kernels.c); M5/M6 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");

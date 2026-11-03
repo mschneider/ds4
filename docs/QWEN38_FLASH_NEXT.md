@@ -402,6 +402,42 @@ At `--ctx-alloc 32768` (22.3 GiB cache) early commit measured steady decode
 of 17.1, 17.8 and 21.0 tok/s against 17.1, 16.0 and 17.6 without it, and on
 the 512-token prompt 20.2 against 15.2.
 
+## Q8_0 hyper-connection weights (fork)
+
+The Q2 GGUF stores the hyper-connection projections
+(`blk.*.hc_{attn,ffn}_{down,up}`) as F16: 1.2 GB read per token, more than
+the routed experts. Strata's packs store them as Q8_0. `gguf-tools/qwen4_hc_q8.c`
+rewrites them as Q8_0 in place in an APFS clone of the model (`cp -c`, about
+1.3 GB of changed blocks; the file size and expert bytes stay the same, so
+the cloned expert pack still validates); the tool's header shows the steps.
+
+The Q8_0 mixer used to fall back to the generic gate/mix kernel, which
+recomputes the low-rank SiLU for every output row: it was slower than F16
+(4.1 + 4.3 ms against 3.4 + 3.6 per token) and prompts read at half speed,
+because Q8_0 was also kept off the prompt GEMM path. Single-token Q8_0 steps
+now use `kernel_qwen4_fork_hc_gate_mix_q8` (`metal/qwen4_fork.metal`) for
+every row count, so MTP verification rows round like single-token steps; it
+computes the SiLU once per threadgroup like the F16 reuse kernel and reads
+each block's quants as four bytes per lane, and prompt chunks over 64 tokens
+use the GEMM path. The mixers then take 2.4 + 2.6 ms. F16 models are unchanged
+(identical output).
+
+M4 Pro 48 GB, Q2, three interleaved `ds4-bench` rounds as above (tok/s), and
+two CLI rounds (warm 4K prompt, 256 tokens, `--ctx 32768`):
+
+| HC weights | Prefill | Decode | Steady decode | CLI decode |
+| --- | ---: | ---: | ---: | ---: |
+| F16 | 221-224 | 18.4-18.9 | 21.5-21.8 | 18.75, 18.85 |
+| Q8_0 | 222-223 | 18.5-19.8 | 22.3-22.9 | 20.22, 20.38 |
+
+Quality on the 100 `qwen38-flash-alibaba-100` cases (`score_official`, 4K
+context): average NLL 0.35382 against 0.35285 (+0.27%), top-1 agreement with
+the reference 89.33% against 89.42%; Q8_0 scored lower NLL on 45 of the 100
+cases. The ISTA expert splice that missed our bar measured 0.43633 and
+86.08%. Greedy output with `--mtp` matched the output without it on the 4K
+prompt and a short coding prompt (21.8 and 22.0 tok/s against 20.4 and
+17.8, one run each).
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3
