@@ -184,7 +184,8 @@ int main(int argc, char **argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = -1;
-    model_params.use_mmap = true;
+    // mmap is the default load mode; the field that forced it (use_mmap)
+    // became a load_mode enum in llama.cpp during 2026-10, so leave it.
 
     llama_model *model = llama_model_load_from_file(model_path, model_params);
     if (!model) die("failed to open model");
