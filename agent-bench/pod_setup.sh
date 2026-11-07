@@ -36,6 +36,12 @@ fi
 docker info >/dev/null 2>&1 || die "Docker daemon not reachable; the agent tasks need it"
 if [ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -f /etc/os-release ]; then
     . /etc/os-release
+    # Ubuntu's unattended-upgrades replaced the NVIDIA user-space libraries
+    # under a running engine on the first pod (driver/library mismatch, every
+    # suite failed). Freeze the driver packages and stop the timer.
+    systemctl disable --now unattended-upgrades >/dev/null 2>&1 || true
+    held=$(dpkg -l 2>/dev/null | awk '/^ii .*nvidia/ { print $2 }')
+    [ -n "$held" ] && apt-mark hold $held >/dev/null 2>&1 || true
     # Rented VM images often ship the driver but no toolkit: add NVIDIA's apt
     # repo and install CUDA 12.8 (works with any driver from 570 on).
     if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ] && [ "${ID:-}" = ubuntu ]; then

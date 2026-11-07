@@ -41,11 +41,14 @@ case $suite in
 esac
 [ $pilot = 1 ] && attempts=1
 model_field "$model" 1 >/dev/null
-# AA-LCR prompts run to 115K tokens plus a 32K answer, two at a time: make
-# sure the engine's context covers that (serve.sh reads these).
+# AA-LCR prompts run to 115K tokens plus a 32K answer, AALCR_CONC at a time
+# (default 2; 1 on a 24 GB card): make sure the engine's context covers that
+# (serve.sh reads these).
 if [ $suite = aalcr ]; then
+    aalcr_conc=${AALCR_CONC:-2}
+    [ "$conc" -gt "$aalcr_conc" ] && conc=$aalcr_conc
     [ "$DS4_CTX" -ge 163840 ] || export DS4_CTX=163840
-    [ "$CTX" -ge 327680 ] || export CTX=327680
+    [ "$CTX" -ge $((163840 * conc)) ] || export CTX=$((163840 * conc))
 fi
 
 run="$RESULTS_DIR/$model/$suite-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -147,7 +150,6 @@ case $suite in
         # The first question is mostly prefill with a short answer (~28 min on
         # an M4 Pro); more only repeat that, so the pilot runs one.
         [ $pilot = 1 ] && [ -z "$limit" ] && n=1
-        [ "$conc" -gt 2 ] && conc=2    # 100K+ prompts; the KV pool holds few at once
         python3 "$BENCH_DIR/aalcr.py" run "$WORK/datasets/aalcr" "$run/aalcr" --api "$api" --model "$model" \
             --epochs "$attempts" --limit "$n" --concurrency "$conc" \
             --timeout "$REQUEST_TIMEOUT" --sampling "$(printf '{"temperature":%s,"top_p":%s,"top_k":%d}' "$TEMPERATURE" "$TOP_P" "$TOP_K")" \
