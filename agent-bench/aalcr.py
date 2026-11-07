@@ -13,7 +13,7 @@ AA uses GPT-5.6 Luna (medium) as the checker; we use JUDGE_MODEL for every
 quant, so scores compare quants, not leaderboard numbers.  The engine needs a
 context of at least prompt + max tokens (about 140K for the longest item).
 """
-import argparse, csv, hashlib, json, os, re, sys, urllib.request, zipfile
+import argparse, csv, hashlib, json, os, re, sys, unicodedata, urllib.request, zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import singleturn as st
@@ -107,6 +107,7 @@ def cmd_fetch(a):
             name = info.filename
             if not info.flag_bits & 0x800:
                 name = name.encode("cp437").decode("utf-8")
+            name = unicodedata.normalize("NFC", name)   # zip built on macOS carries NFD names
             dest = os.path.realpath(os.path.join(root, name))
             if not dest.startswith(root + os.sep):
                 sys.exit(f"aalcr: unsafe path in zip: {name}")
@@ -118,14 +119,26 @@ def cmd_fetch(a):
     print(f"aalcr: v1.1 verified in {a.dir}")
 
 
+def doc_path(folder, fn):
+    """The CSV lists NFC filenames; an already-extracted tree may hold them in NFD (zip built on macOS)."""
+    p = os.path.join(folder, fn)
+    if os.path.exists(p):
+        return p
+    want = unicodedata.normalize("NFC", fn)
+    for name in os.listdir(folder):
+        if unicodedata.normalize("NFC", name) == want:
+            return os.path.join(folder, name)
+    return p   # let open() raise the original error
+
+
 def questions(d):
     rows = list(csv.DictReader(open(os.path.join(d, "AA-LCR_Dataset.csv"), encoding="utf-8")))
     root = os.path.join(d, "text", "lcr")
     for r in rows:
         docs = []
+        folder = os.path.join(root, r["document_category"], r["document_set_id"])
         for fn in r["data_source_filenames"].split(";"):
-            docs.append(open(os.path.join(root, r["document_category"], r["document_set_id"], fn),
-                             encoding="utf-8").read())
+            docs.append(open(doc_path(folder, fn), encoding="utf-8").read())
         text = "\n\n".join(f"BEGIN DOCUMENT {i + 1}:\n{doc}\nEND DOCUMENT {i + 1}" for i, doc in enumerate(docs))
         yield r, PROMPT.format(documents_text=text, question=r["question"])
 
