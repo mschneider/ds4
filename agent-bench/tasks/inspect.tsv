@@ -1,0 +1,9 @@
+# Inspect AI tasks (inspect_evals 0.27.0).  Columns: task, epochs, limit (0 = all), -T task args (- = none), needs.
+# Epochs follow the Muse Glimmer methodology report where it states them (AIME 10, GPQA via AA).
+aime2026	10	0	-	-
+gpqa_diamond	4	0	-	hf-gated
+wmdp_bio	1	0	-	-
+wmdp_chem	1	0	-	-
+lab_bench_protocolqa	1	0	-	-
+scicode	1	0	provide_scientific_background=true	docker
+hle	1	500	include_multi_modal=false	judge,hf-gated

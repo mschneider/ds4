@@ -1,0 +1,3 @@
+fp8-rmsnorm-gemm
+jax-speedrun-gpu
+math-eval-grader
