@@ -2,7 +2,7 @@
 # engine: llama = upstream llama.cpp (CUDA), prism = PrismML llama.cpp (PQ2_0),
 # ds4 = this repository's CUDA build.  C6 lives in a private repo: set C6_REPO
 # and HF_TOKEN on the pod.  Hashes are Hugging Face LFS sha256 values.
-qwen38-27b-c6	llama	${C6_REPO}	main	C6-gdnattnhead-q6k-im.gguf	90ae6bad031a05ec551634a32ab09de97f3d9e1269d4b10280effd2346464b61
+qwen38-27b-c6	llama	${C6_REPO}	d2150b919a11fa19dd061d603d1b4332336fc53d	C6-gdnattnhead-q6k-im.gguf	90ae6bad031a05ec551634a32ab09de97f3d9e1269d4b10280effd2346464b61
 qwen38-27b-q4km	llama	ggml-org/Qwen3.8-27B-GGUF	a316ea527fde32c12487be7574e2db5ac2ad2a7e	Qwen3.8-27B-Q4_K_M.gguf	c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747
 bonsai2-pq2	prism	prism-ml/Ternary-Bonsai-2-27B-gguf	94dd51cdbbec5309ed8b76a12f3268bc4fdceb93	Ternary-Bonsai-2-27B-PQ2_0.gguf	3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1
 flash-next-q2	ds4	antirez/qwen3.8-flash-next-gguf	d600fe1a43d2e1cdcadb85144ce3142f66f9eefe	Qwen3.8-Flash-Next-Q2.gguf	b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9

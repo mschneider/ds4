@@ -34,6 +34,22 @@ if [ ${#need_pkgs[@]} -gt 0 ]; then
     done
 fi
 docker info >/dev/null 2>&1 || die "Docker daemon not reachable; the agent tasks need it"
+if [ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -f /etc/os-release ]; then
+    . /etc/os-release
+    # Rented VM images often ship the driver but no toolkit: add NVIDIA's apt
+    # repo and install CUDA 12.8 (works with any driver from 570 on).
+    if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ] && [ "${ID:-}" = ubuntu ]; then
+        tag=ubuntu$(echo "$VERSION_ID" | tr -d .)
+        curl -fsSL -o /tmp/cuda-keyring.deb "https://developer.download.nvidia.com/compute/cuda/repos/$tag/x86_64/cuda-keyring_1.1-1_all.deb"
+        dpkg -i /tmp/cuda-keyring.deb >/dev/null && apt-get update -qq && apt-get install -y -qq cuda-toolkit-12-8
+    fi
+    # tau2-bench needs Python 3.12; Ubuntu 22.04 ships 3.10.
+    if ! command -v python3.12 >/dev/null && ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null && [ "${ID:-}" = ubuntu ]; then
+        apt-get install -y -qq software-properties-common >/dev/null
+        add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 && apt-get update -qq
+        apt-get install -y -qq python3.12 python3.12-venv python3.12-dev
+    fi
+fi
 if [ "$os" = Darwin ]; then
     gpu_flags=() ds4_target=""          # Metal is the default on macOS
 else
