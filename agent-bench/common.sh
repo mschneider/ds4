@@ -33,6 +33,17 @@ JUDGE_MODEL=${JUDGE_MODEL:-openrouter/openai/gpt-oss-120b}
 # Serving: the engine on SERVER_PORT, the logging proxy on PROXY_PORT.
 SERVER_PORT=${SERVER_PORT:-8080}
 PROXY_PORT=${PROXY_PORT:-9000}
+# A 24 GB card cannot hold the 256K pool next to the weights (the first Vast
+# pilot ran 128K for 8 slots and eight agent sessions exhausted it: every
+# "Context size has been exceeded" was counted as an infrastructure error).
+# Below 40 GB the defaults become 4 sessions on a 192K pool (20.8 GB measured
+# on an RTX 4090 with Bonsai 2); explicit CTX/PARALLEL still win.
+if [ -z "${CTX:-}${PARALLEL:-}" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc 0-9)
+    if [ -n "$vram_mib" ] && [ "$vram_mib" -lt 40000 ]; then
+        CTX=196608 PARALLEL=4
+    fi
+fi
 CTX=${CTX:-262144}          # llama.cpp: one KV pool shared by all slots
 PARALLEL=${PARALLEL:-8}     # concurrent sessions served
 DS4_CTX=${DS4_CTX:-131072}  # ds4: per session
@@ -44,9 +55,11 @@ TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:-20}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-131072}
 MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-32768}
-# Harbor's agent timeouts are wall-clock, so a slow machine loses score; keep
-# 1.0 when per-session speed is near a datacenter API, raise it otherwise.
-AGENT_TIMEOUT_MULT=${AGENT_TIMEOUT_MULT:-1.0}
+# Harbor's agent timeouts are wall-clock and sized for datacenter APIs. One
+# GPU serving 4-8 thinking sessions decodes ~60-70 tok/s per session, so at
+# 1.0 most Terminal-Bench trials timed out after 3-16 steps (Vast pilot,
+# 2026-11-08); 4.0 gives the same number of turns a fast API would get.
+AGENT_TIMEOUT_MULT=${AGENT_TIMEOUT_MULT:-4.0}
 # Per-request timeout for every client of the model (and the proxy). The
 # OpenAI SDK default of 600 s makes LiteLLM/Inspect resend long thinking
 # requests while the abandoned one keeps generating in its slot.

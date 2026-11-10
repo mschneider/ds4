@@ -33,7 +33,13 @@ if [ ${#need_pkgs[@]} -gt 0 ]; then
         esac
     done
 fi
-docker info >/dev/null 2>&1 || die "Docker daemon not reachable; the agent tasks need it"
+if ! docker info >/dev/null 2>&1; then
+    # The Harbor suites need the daemon; local macOS runs of the single-turn
+    # suites and tau2 do not, and Docker Desktop's VM would take unified memory
+    # from the model.
+    [ "$os" = Darwin ] && echo "warning: Docker daemon not reachable; Harbor suites will not run" ||
+        die "Docker daemon not reachable; the agent tasks need it"
+fi
 if [ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -f /etc/os-release ]; then
     . /etc/os-release
     # Ubuntu's unattended-upgrades replaced the NVIDIA user-space libraries

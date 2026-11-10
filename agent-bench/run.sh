@@ -247,7 +247,22 @@ case $suite in
                 --max-concurrency "$conc" --save-to "$model-$domain-$(basename "$run")") \
                 2>&1 | tee -a "$run/harness.log"
             cp -r "$WORK/tau2-bench/data/simulations/$model-$domain-$(basename "$run")" "$run/tau2-$domain"
-        done ;;
+        done
+        # tau2 leaves a simulation that died on an engine error (context
+        # exhausted, say) without a reward and out of its average; here it is
+        # a failed task: score.txt reports the mean over every task.
+        python3 - "$run" <<'PY' | tee "$run/score.txt"
+import glob, json, os, sys, collections
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "tau2-*", "results.json"))):
+    sims = json.load(open(f)).get("simulations") or []
+    r = [(s.get("reward_info") or {}).get("reward") for s in sims]
+    scored = [x for x in r if x is not None]
+    terms = collections.Counter(s.get("termination_reason") or "unknown" for s in sims)
+    print(f"{os.path.basename(os.path.dirname(f))}: mean {sum(scored) / len(r):.3f} over {len(r)} tasks"
+          f" ({len(r) - len(scored)} unscored counted as 0; mean of scored {sum(scored) / max(1, len(scored)):.3f});"
+          f" terminations {dict(terms)}" if r else f"{f}: no simulations")
+PY
+        ;;
 esac
 
 "$BENCH_DIR/serve.sh" stop
