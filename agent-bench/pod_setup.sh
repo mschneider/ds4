@@ -148,6 +148,9 @@ if [ ! -x "$WORK/inspect-venv/bin/inspect" ]; then
     "$PY" -m venv "$WORK/inspect-venv"
     "$WORK/inspect-venv/bin/pip" install -q "inspect-ai==$INSPECT_AI_VERSION" "inspect-evals==$INSPECT_EVALS_VERSION" openai
 fi
+# inspect-ai 0.3.287 imports acp.helpers, dropped in agent-client-protocol 1.0.0.
+"$WORK/inspect-venv/bin/python" -c 'import acp.helpers' 2>/dev/null ||
+    "$WORK/inspect-venv/bin/pip" install -q "agent-client-protocol<1"
 # SciCode fetches its test data from Google Drive.
 "$WORK/inspect-venv/bin/python" -c 'import gdown' 2>/dev/null ||
     "$WORK/inspect-venv/bin/pip" install -q "gdown==5.2.0"
