@@ -368,8 +368,14 @@ kernel void flint_route_scatter(const device uint* ids [[buffer(0)]],
 // simdgroups of 32 x 32 (fp_mma); smaller: 1 x 4 simdgroups of BM x 16.
 // Each output element accumulates its k products in the same order in every
 // height, so an expert's rows come out bit-identical whichever tile holds them.
-template <int BM>
-inline void fp_moe_load_a(threadgroup bfloat16_t* As, FpRowsGather src, uint k0, ushort tid) {
+// Register prefetch for the MoE tiles: every expert's weights are read from
+// DRAM exactly once (no reuse across row tiles, unlike the dense GEMM), so
+// the next k tile's A rows and raw q4 words are loaded into registers while
+// the current tile multiplies, and stored (dequantized) after the barrier.
+// The dequantization expression is fp_load_b_q4's, so the tiles are
+// bit-identical.
+template <int BM, typename Src>
+inline void fp_moe_load_a(threadgroup bfloat16_t* As, Src src, uint k0, ushort tid) {
     for (uint i = tid; i < BM * 4u; i += FP_THREADS) {
         const uint r = i >> 2, c = (i & 3u) * 8u;
         const device bfloat16_t* p = src.row(r);
@@ -377,14 +383,22 @@ inline void fp_moe_load_a(threadgroup bfloat16_t* As, FpRowsGather src, uint k0,
         *dst = p ? *(const device vec<bfloat16_t, 8>*)(p + k0 + c) : vec<bfloat16_t, 8>(bfloat16_t(0.0f));
     }
 }
-template <int BM>
-inline void fp_moe_load_a(threadgroup bfloat16_t* As, FpRowsSorted src, uint k0, ushort tid) {
-    for (uint i = tid; i < BM * 4u; i += FP_THREADS) {
-        const uint r = i >> 2, c = (i & 3u) * 8u;
-        const device bfloat16_t* p = src.row(r);
-        threadgroup vec<bfloat16_t, 8>* dst = (threadgroup vec<bfloat16_t, 8>*)(As + r * FP_LDS + c);
-        *dst = p ? *(const device vec<bfloat16_t, 8>*)(p + k0 + c) : vec<bfloat16_t, 8>(bfloat16_t(0.0f));
-    }
+struct FpQ4Pre { ulong bits; float s, b; };
+inline FpQ4Pre fp_pre_b_q4(const device uchar* W, const device bfloat16_t* S, const device bfloat16_t* Bz,
+                           uint n0, uint k0, uint K, ushort tid) {
+    const ushort r = tid >> 1, hf = tid & 1;
+    const uint n = n0 + r;
+    const uint gi = n * (K >> 6) + (k0 >> 6);
+    FpQ4Pre p;
+    p.s = float(S[gi]);
+    p.b = float(Bz[gi]);
+    p.bits = *(const device ulong*)(W + (size_t)n * (K >> 1) + (k0 >> 1) + hf * 8u);
+    return p;
+}
+inline void fp_put_b_q4(threadgroup bfloat16_t* Bs, FpQ4Pre p, ushort tid) {
+    const ushort r = tid >> 1, hf = tid & 1;
+    threadgroup bfloat16_t* dst = Bs + r * FP_LDS + hf * 16;
+    for (uint i = 0; i < 16; i++) dst[i] = bfloat16_t(p.s * float((p.bits >> (4 * i)) & 15ul) + p.b);
 }
 
 template <int FR, int FC>
@@ -429,13 +443,23 @@ kernel void flint_moe_gateup(const device bfloat16_t* X [[buffer(0)]],        //
     fp_zero_t(acc);
     fp_zero_t(acc2);
     FpRowsGather src = {X, rows, 2048u, tile.begin, tile.count};
+    const device uchar* gw = pack + FP_PACK_GATE_W;
+    const device bfloat16_t* gs = (const device bfloat16_t*)(pack + FP_PACK_GATE_S);
+    const device bfloat16_t* gb = (const device bfloat16_t*)(pack + FP_PACK_GATE_B);
+    const device uchar* uw = pack + FP_PACK_UP_W;
+    const device bfloat16_t* us = (const device bfloat16_t*)(pack + FP_PACK_UP_S);
+    const device bfloat16_t* ub = (const device bfloat16_t*)(pack + FP_PACK_UP_B);
+    FpQ4Pre pg = fp_pre_b_q4(gw, gs, gb, n0, 0u, 2048u, tid);
+    FpQ4Pre pu = fp_pre_b_q4(uw, us, ub, n0, 0u, 2048u, tid);
     for (uint k0 = 0; k0 < 2048u; k0 += FP_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         fp_moe_load_a<BM>(As, src, k0, tid);
-        fp_load_b_q4(Bs, pack + FP_PACK_GATE_W, (const device bfloat16_t*)(pack + FP_PACK_GATE_S),
-                     (const device bfloat16_t*)(pack + FP_PACK_GATE_B), n0, k0, 2048u, tid);
-        fp_load_b_q4(Bs2, pack + FP_PACK_UP_W, (const device bfloat16_t*)(pack + FP_PACK_UP_S),
-                     (const device bfloat16_t*)(pack + FP_PACK_UP_B), n0, k0, 2048u, tid);
+        fp_put_b_q4(Bs, pg, tid);
+        fp_put_b_q4(Bs2, pu, tid);
+        if (k0 + FP_BK < 2048u) {
+            pg = fp_pre_b_q4(gw, gs, gb, n0, k0 + FP_BK, 2048u, tid);
+            pu = fp_pre_b_q4(uw, us, ub, n0, k0 + FP_BK, 2048u, tid);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         fp_mma_t(acc, As, Bs, sm, sn);
         fp_mma_t(acc2, As, Bs2, sm, sn);
@@ -481,11 +505,17 @@ kernel void flint_moe_down(const device bfloat16_t* act [[buffer(0)]],
     simdgroup_matrix<float, 8, 8> acc[FR][FC];
     fp_zero_t(acc);
     FpRowsSorted src = {act, 512u, tile.begin, tile.count};
+    const device uchar* dw = pack + FP_PACK_DOWN_W;
+    const device bfloat16_t* ds = (const device bfloat16_t*)(pack + FP_PACK_DOWN_S);
+    const device bfloat16_t* db = (const device bfloat16_t*)(pack + FP_PACK_DOWN_B);
+    FpQ4Pre pd = fp_pre_b_q4(dw, ds, db, n0, 0u, 512u, tid);
     for (uint k0 = 0; k0 < 512u; k0 += FP_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         fp_moe_load_a<BM>(As, src, k0, tid);
-        fp_load_b_q4(Bs, pack + FP_PACK_DOWN_W, (const device bfloat16_t*)(pack + FP_PACK_DOWN_S),
-                     (const device bfloat16_t*)(pack + FP_PACK_DOWN_B), n0, k0, 512u, tid);
+        fp_put_b_q4(Bs, pd, tid);
+        if (k0 + FP_BK < 512u) {
+            pd = fp_pre_b_q4(dw, ds, db, n0, k0 + FP_BK, 512u, tid);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         fp_mma_t(acc, As, Bs, sm, sn);
     }
