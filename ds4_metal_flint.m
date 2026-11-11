@@ -298,6 +298,9 @@ struct ds4_flint_gpu_session {
     id<MTLBuffer> metadata;
     id<MTLBuffer> workspace, partials, statistics, routing;
     id<MTLBuffer> logits, trace, diagnostic, control, requests;
+    id<MTLBuffer> parameters;          /* 8 words, written before each commit */
+    id<MTLCommandBuffer> next_cb;      /* the next step, encoded while this one runs */
+    NSUInteger next_cb_bufs;           /* g_flint_stream_bufs count it was encoded with */
     int broken;
 };
 
@@ -383,8 +386,9 @@ ds4_flint_gpu_session *ds4_flint_gpu_session_create(uint32_t ctx_cap) {
         s->diagnostic = flint_buffer(FLINT_WORKERS * 4, "ds4_flint_diagnostic", 1);
         s->control = flint_buffer(FLINT_CONTROL_WORDS * 4, "ds4_flint_control", 1);
         s->requests = flint_buffer(FLINT_REQUEST_WORDS * 4, "ds4_flint_requests", 1);
+        s->parameters = flint_buffer(32, "ds4_flint_parameters", 1);
         if (!s->metadata || !s->workspace || !s->partials || !s->statistics || !s->routing ||
-            !s->logits || !s->trace || !s->diagnostic || !s->control || !s->requests) {
+            !s->logits || !s->trace || !s->diagnostic || !s->control || !s->requests || !s->parameters) {
             goto fail;
         }
         uint32_t *meta = (uint32_t *)[s->metadata contents];
@@ -405,6 +409,7 @@ void ds4_flint_gpu_session_free(ds4_flint_gpu_session *s) {
     for (uint32_t b = 0; b < DS4_FLINT_GPU_MAX_BLOCKS; b++) s->kv[b] = nil;
     s->metadata = nil; s->workspace = nil; s->partials = nil; s->statistics = nil; s->routing = nil;
     s->logits = nil; s->trace = nil; s->diagnostic = nil; s->control = nil; s->requests = nil;
+    s->parameters = nil; s->next_cb = nil;
     free(s);
 }
 
@@ -452,6 +457,47 @@ int ds4_flint_gpu_kv_read(const ds4_flint_gpu_session *s, uint32_t layer, int ke
     return 1;
 }
 
+/* Decode launches go through their own queue: a step's command buffer is
+ * encoded while the previous step runs on the GPU (the parameters come from
+ * s->parameters, written just before the commit), so the encoding and the
+ * useResource bookkeeping leave the per-token critical path.
+ * DS4_FLINT_NO_OVERLAP=1 encodes each step after the previous one completed
+ * (the old order) for comparison. */
+static id<MTLCommandQueue> g_flint_decode_queue;
+
+static id<MTLCommandBuffer> flint_decode_encode(ds4_flint_gpu_session *s) {
+    if (!g_flint_decode_queue) {
+        g_flint_decode_queue = [g_flint_device newCommandQueue];
+        if (!g_flint_decode_queue) return nil;
+        g_flint_decode_queue.label = @"ds4_flint_decode";
+    }
+    id<MTLCommandBuffer> cb = [g_flint_decode_queue commandBuffer];
+    if (!cb) return nil;
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    if (!enc) return nil;
+    [enc setComputePipelineState:g_flint_decode];
+    flint_use_resources(enc);
+    [enc setBuffer:g_flint_model offset:0 atIndex:0];
+    [enc setBuffer:s->metadata offset:0 atIndex:1];
+    for (uint32_t b = 0; b < DS4_FLINT_GPU_MAX_BLOCKS; b++) [enc setBuffer:s->kv[b] offset:0 atIndex:2 + b];
+    [enc setBuffer:s->parameters offset:0 atIndex:6];
+    [enc setBuffer:g_flint_silu offset:0 atIndex:7];
+    [enc setBuffer:s->control offset:0 atIndex:8];
+    [enc setBuffer:g_flint_experts offset:0 atIndex:9];
+    [enc setBuffer:s->logits offset:0 atIndex:10];
+    [enc setBuffer:s->trace offset:0 atIndex:11];
+    [enc setBuffer:s->diagnostic offset:0 atIndex:12];
+    [enc setBuffer:s->workspace offset:0 atIndex:13];
+    [enc setBuffer:s->partials offset:0 atIndex:14];
+    [enc setBuffer:s->statistics offset:0 atIndex:15];
+    [enc setBuffer:s->routing offset:0 atIndex:16];
+    [enc setBuffer:s->requests offset:0 atIndex:17];
+    [enc dispatchThreadgroups:MTLSizeMake(FLINT_WORKERS, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
+    [enc endEncoding];
+    s->next_cb_bufs = [g_flint_stream_bufs count];
+    return cb;
+}
+
 int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t position,
                          uint32_t initial_position, uint16_t *logits_bf16, uint16_t *trace_bf16,
                          char *err, size_t errlen) {
@@ -478,48 +524,33 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
         /* DS4_FLINT_DECODE_PROFILE=1: GPU time of the launch against the wall
          * time of the step (command buffer creation to completion), averaged
          * over 64 steps and printed with the position. */
-        static int dprof = -1;
+        static int dprof = -1, overlap = -1;
         static double dprof_gpu = 0, dprof_wall = 0;
         static uint32_t dprof_n = 0;
         if (dprof < 0) dprof = getenv("DS4_FLINT_DECODE_PROFILE") ? 1 : 0;
+        if (overlap < 0) overlap = getenv("DS4_FLINT_NO_OVERLAP") ? 0 : 1;
         for (;;) {
             const double t_wall0 = dprof ? ds4_flint_now_s() : 0;
             memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
             memset([s->diagnostic contents], 0, FLINT_WORKERS * 4);
             memset([s->requests contents], 0, FLINT_REQUEST_WORDS * 4);
             const uint32_t parameters[8] = { token, position, initial_position, layer_count, layer_start, streaming, 0, 0 };
-            int owned = 0;
-            id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+            memcpy([s->parameters contents], parameters, sizeof(parameters));
+            id<MTLCommandBuffer> cb = s->next_cb;
+            s->next_cb = nil;
+            if (cb && s->next_cb_bufs != [g_flint_stream_bufs count]) cb = nil;
+            if (!cb) cb = flint_decode_encode(s);
             if (!cb) {
                 if (err && errlen) snprintf(err, errlen, "no Metal command buffer");
                 return 0;
             }
-            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-            if (!enc) {
-                if (err && errlen) snprintf(err, errlen, "no Metal compute encoder");
-                return 0;
-            }
-            [enc setComputePipelineState:g_flint_decode];
-            flint_use_resources(enc);
-            [enc setBuffer:g_flint_model offset:0 atIndex:0];
-            [enc setBuffer:s->metadata offset:0 atIndex:1];
-            for (uint32_t b = 0; b < DS4_FLINT_GPU_MAX_BLOCKS; b++) [enc setBuffer:s->kv[b] offset:0 atIndex:2 + b];
-            [enc setBytes:parameters length:sizeof(parameters) atIndex:6];
-            [enc setBuffer:g_flint_silu offset:0 atIndex:7];
-            [enc setBuffer:s->control offset:0 atIndex:8];
-            [enc setBuffer:g_flint_experts offset:0 atIndex:9];
-            [enc setBuffer:s->logits offset:0 atIndex:10];
-            [enc setBuffer:s->trace offset:0 atIndex:11];
-            [enc setBuffer:s->diagnostic offset:0 atIndex:12];
-            [enc setBuffer:s->workspace offset:0 atIndex:13];
-            [enc setBuffer:s->partials offset:0 atIndex:14];
-            [enc setBuffer:s->statistics offset:0 atIndex:15];
-            [enc setBuffer:s->routing offset:0 atIndex:16];
-            [enc setBuffer:s->requests offset:0 atIndex:17];
-            [enc dispatchThreadgroups:MTLSizeMake(FLINT_WORKERS, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
-            ds4_metal_end_compute_encoder(cb, enc);
-            if (!ds4_metal_finish_command_buffer(cb, owned, "flint_decode")) {
-                if (err && errlen) snprintf(err, errlen, "flint_decode command buffer failed");
+            [cb commit];
+            if (overlap) s->next_cb = flint_decode_encode(s);
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                s->next_cb = nil;
+                if (err && errlen) snprintf(err, errlen, "flint_decode command buffer failed: %s",
+                                            cb.error ? [[cb.error localizedDescription] UTF8String] : "status");
                 return 0;
             }
             if (dprof) {
