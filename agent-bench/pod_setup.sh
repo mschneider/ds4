@@ -58,8 +58,15 @@ if [ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -f /etc/os-release ]; then
     # tau2-bench needs Python 3.12; Ubuntu 22.04 ships 3.10.
     if ! command -v python3.12 >/dev/null && ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null && [ "${ID:-}" = ubuntu ]; then
         apt-get install -y -qq software-properties-common >/dev/null
-        add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 && apt-get update -qq
-        apt-get install -y -qq python3.12 python3.12-venv python3.12-dev
+        # Some hosts cannot reach Launchpad; fall back to uv's standalone CPython build.
+        if timeout 120 add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 && apt-get update -qq &&
+           apt-get install -y -qq python3.12 python3.12-venv python3.12-dev; then :; else
+            echo "deadsnakes PPA unavailable; installing Python 3.12 with uv"
+            command -v uv >/dev/null ||
+                curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh >/dev/null
+            uv python install 3.12 --install-dir /opt/uv-python >/dev/null
+            ln -sf "$(ls -d /opt/uv-python/cpython-3.12*/bin/python3.12 | head -1)" /usr/local/bin/python3.12
+        fi
     fi
 fi
 if [ "$os" = Darwin ]; then
